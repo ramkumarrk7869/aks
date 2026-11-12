@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   build-and-deploy:
-    runs-on: [self-hosted, linux, aks-private]
+    runs-on: self-hosted
     env:
       ACR_NAME: ${{ secrets.ACR_NAME }}
       ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
