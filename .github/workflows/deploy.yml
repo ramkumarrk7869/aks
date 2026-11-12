@@ -1,0 +1,83 @@
+name: Build and deploy nginx site
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-nginx-site
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: [self-hosted, linux, aks-private]
+    env:
+      ACR_NAME: ${{ secrets.ACR_NAME }}
+      ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+      AKS_RESOURCE_GROUP: ${{ secrets.AKS_RESOURCE_GROUP }}
+      AKS_CLUSTER_NAME: ${{ secrets.AKS_CLUSTER_NAME }}
+      NGINX_HOST: ${{ secrets.NGINX_HOST }}
+      IMAGE_NAME: nginx-site
+      IMAGE_TAG: ${{ github.sha }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Sign in to Azure with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate deployment configuration
+        run: |
+          for name in ACR_NAME ACR_LOGIN_SERVER AKS_RESOURCE_GROUP AKS_CLUSTER_NAME NGINX_HOST; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Set the GitHub Actions secret $name."
+              exit 1
+            fi
+          done
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.3
+
+      - name: Sign in to ACR
+        run: az acr login --name "$ACR_NAME"
+
+      - name: Build and push image
+        run: |
+          docker build --tag "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG" .
+          docker push "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG"
+
+      - name: Connect to private AKS
+        run: az aks get-credentials --resource-group "$AKS_RESOURCE_GROUP" --name "$AKS_CLUSTER_NAME" --admin --overwrite-existing
+
+      - name: Create internal ingress controller
+        run: kubectl apply -f deploy/nginx-internal-controller.yaml
+
+      - name: Deploy website with Helm
+        run: |
+          helm upgrade --install nginx-site ./charts/nginx-site \
+            --namespace web \
+            --create-namespace \
+            --set-string image.repository="$ACR_LOGIN_SERVER/$IMAGE_NAME" \
+            --set-string image.tag="$IMAGE_TAG" \
+            --set-string ingress.host="$NGINX_HOST" \
+            --wait \
+            --timeout 5m
+
+      - name: Show deployment and internal ingress
+        run: |
+          kubectl get deployment,service,ingress -n web
+          kubectl get nginxingresscontroller nginx-internal
+          kubectl get service -n app-routing-system
