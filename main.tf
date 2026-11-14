@@ -55,7 +55,7 @@ resource "azurerm_kubernetes_cluster" "aks" {
   private_cluster_public_fqdn_enabled = false
   web_app_routing {
     dns_zone_ids             = []
-    default_nginx_controller = "AnnotationControlled"
+    default_nginx_controller = "None"
   }
   oidc_issuer_enabled       = true
   workload_identity_enabled = true

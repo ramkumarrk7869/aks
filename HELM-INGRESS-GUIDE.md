@@ -364,11 +364,11 @@ kubectl get nginxingresscontroller nginx-internal -o yaml
 kubectl get pods --namespace app-routing-system -o wide
 ```
 
-The GitHub Actions workflow also applies this manifest on every deployment, so pushing the change to the branch that triggers the workflow will apply it. The controller may take time to scale down. Verify the resulting pod count and make sure the remaining pod is `Running` and ready. To restore the previous two-pod minimum, change `minReplicas` back to `2` and apply the manifest again.
+The GitHub Actions workflow also applies this manifest on every deployment. To apply a change through Actions, start the workflow manually after the change is pushed; pushes by themselves do not deploy. The controller may take time to scale down. Verify the resulting pod count and make sure the remaining pod is `Running` and ready. To restore the previous two-pod minimum, change `minReplicas` back to `2` and apply the manifest again.
 
 ## 6. How GitHub Actions deploys the site
 
-The workflow file is `.github/workflows/deploy.yml`. It runs when code is pushed to `main` or when **Actions → Build and deploy nginx site → Run workflow** is selected.
+The workflow file is `.github/workflows/deploy.yml`. It is started manually from **Actions → Build and deploy nginx site → Run workflow**. Pushes to branches are ignored, so editing or pushing code does not automatically deploy it.
 
 The runner is configured as:
 

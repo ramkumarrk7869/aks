@@ -2,8 +2,8 @@ name: Build and deploy nginx site
 
 on:
   push:
-    branches:
-      - main
+    branches-ignore:
+      - '**'
   workflow_dispatch:
 
 permissions:

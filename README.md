@@ -24,11 +24,12 @@ This repository provisions and deploys a small private website. The major compon
 | `system` node pool | Runs Kubernetes system components and workloads | Terraform, through `node_count` and `node_vm_size` |
 | `workload` node pool | Adds compute capacity for workloads | Terraform, currently one node in `main.tf` |
 | Application-routing add-on and `app-routing-system` namespace | Provides the managed NGINX ingress controller platform | AKS |
+| Default NGINX controller | Disabled because this project does not use its `webapprouting.kubernetes.azure.com` class or public load balancer | `web_app_routing.default_nginx_controller = "None"` in `main.tf` |
 | `nginx-internal` controller configuration | Requests a private load balancer and sets the controller's minimum replica count | `deploy/nginx-internal-controller.yaml`, applied by GitHub Actions |
 | Website Deployment, Service, and Ingress | Runs the website and routes matching HTTP requests | Helm chart in `charts/nginx-site`, installed by GitHub Actions |
 | Container image | NGINX plus `site/index.html` | Dockerfile, pushed to ACR by GitHub Actions |
 
-The website's request path is:
+The website's request path uses the dedicated internal controller; the unused default controller is not part of this path:
 
 ```text
 Client on a connected private network
@@ -104,9 +105,70 @@ The workflow at `.github/workflows/deploy.yml` builds and pushes the image to AC
 
 ### Enable AKS application routing
 
-The `web_app_routing` block in [main.tf](./main.tf) declares AKS application routing so Terraform tracks the add-on and does not plan to remove it. Its empty `dns_zone_ids` list means this project is not attaching a custom Azure DNS zone. The `AnnotationControlled` setting leaves Ingress class selection to each Ingress resource. The add-on provides the managed controller and `NginxIngressController` resource type used by the internal controller manifest and website Ingress. The controller manifest at [deploy/nginx-internal-controller.yaml](./deploy/nginx-internal-controller.yaml) sets its supported minimum replica count to one; this reduces baseline capacity but also controller redundancy. Per-pod CPU and memory requests/limits are managed by the AKS add-on and are not configurable through this manifest.
+The `web_app_routing` block in [main.tf](./main.tf) declares the AKS application-routing add-on so Terraform tracks it and does not plan to remove it. Its empty `dns_zone_ids` list means this project is not attaching a custom Azure DNS zone. The add-on provides the managed controller platform and `NginxIngressController` resource type used by the dedicated internal controller manifest and website Ingress. In this project, `default_nginx_controller = "None"` disables creation of the add-on's **default** NGINX controller. It does not disable the application-routing add-on or the separate `nginx-internal` controller. The website Ingress uses the `nginx-internal` class, not the default `webapprouting.kubernetes.azure.com` class. Disabling the unused default controller avoids running its extra controller pods and public load-balancer Service when they are not needed.
 
-If enabling it outside Terraform, as you already did, this command does that through Azure's management plane and does not require direct access to the private Kubernetes API:
+#### Exact change made in `main.tf`
+
+Inside the `azurerm_kubernetes_cluster` resource, the `web_app_routing` block remains in place. Only the value of `default_nginx_controller` changed:
+
+```diff
+ web_app_routing {
+   dns_zone_ids             = []
+-  default_nginx_controller = "AnnotationControlled"
++  default_nginx_controller = "None"
+ }
+```
+
+`AnnotationControlled` allowed AKS application routing to create its default NGINX controller. `"None"` tells the add-on not to create that default controller. Keeping the `web_app_routing` block enabled is important: it preserves the add-on and the custom `NginxIngressController` support that the separate `nginx-internal` controller uses. The internal controller is configured independently in `deploy/nginx-internal-controller.yaml`, so this change does not change its private IP, ingress class, or minimum replica setting.
+
+The internal controller manifest at [deploy/nginx-internal-controller.yaml](./deploy/nginx-internal-controller.yaml) requests a private load balancer and sets its supported minimum replica count to one. This reduces baseline capacity but also controller redundancy. Per-pod CPU and memory requests/limits are managed by the AKS add-on and are not configurable through this manifest.
+
+#### Disable and remove the unused default controller
+
+The setting in `main.tf` is the desired configuration for future Terraform applies. To update an existing cluster, first check whether any Ingress uses the default class:
+
+```bash
+kubectl get ingress --all-namespaces -o wide
+kubectl get ingressclass
+kubectl get nginxingresscontroller
+```
+
+In this project the website Ingress uses class `nginx-internal`; the default controller uses class `webapprouting.kubernetes.azure.com`. Only remove the default controller if no application needs that default class. Do not delete the whole application-routing add-on, because the internal controller depends on it.
+
+From the Terraform working directory, review and apply the configuration change:
+
+```bash
+terraform fmt -check
+terraform validate
+terraform plan
+```
+
+Confirm that the plan keeps the AKS cluster and the `web_app_routing` add-on, and does not unexpectedly replace or destroy the cluster. If the plan is unexpected, stop and investigate rather than applying it. If it is understood and safe:
+
+```bash
+terraform apply
+```
+
+Setting the default controller type to `None` prevents the add-on from creating the default controller, but on an existing cluster it does not automatically delete the existing default `NginxIngressController` custom resource. After the Terraform update succeeds, and after confirming it is unused, remove only that resource:
+
+```bash
+kubectl delete nginxingresscontroller default
+```
+
+Deleting this custom resource asks the add-on to remove the default controller's Deployment, pods, and public `nginx` Service/load balancer. Do not delete `nginx-internal`; that is the controller serving the website. Verify the remaining controller, Service, Ingress, and website:
+
+```bash
+kubectl get nginxingresscontroller
+kubectl get pods,services --namespace app-routing-system -o wide
+kubectl get ingress --all-namespaces -o wide
+kubectl get endpoints --namespace web
+```
+
+Expected: `nginx-internal` remains, the website Ingress still uses class `nginx-internal`, and its internal load balancer still has a private IP. The default `nginx` controller and its public load-balancer Service should be gone. If the default controller reappears, check that Terraform still says `None` and that no separate Azure CLI or configuration-management action is setting it back.
+
+Prefer Terraform as the source of truth for this setting. Avoid changing the setting only with `az aks approuting update`, because that can leave Terraform configuration and Azure out of sync.
+
+If you need to enable the add-on manually on an existing cluster, Azure CLI can do so through the Azure management plane without direct access to the private Kubernetes API:
 
 ```bash
 az aks approuting enable --resource-group "rg-private-aks" --name "aks-private"
@@ -265,7 +327,7 @@ gh secret set AKS_CLUSTER_NAME --repo "${OWNER}/${REPO}" --body "$CLUSTER_NAME"
 gh secret set NGINX_HOST --repo "${OWNER}/${REPO}" --body "$NGINX_HOST"
 ```
 
-After enabling the add-on, setting up the runner, and granting roles, push to `main` or run **Actions → Build and deploy nginx site → Run workflow**.
+After enabling the add-on, setting up the runner, and granting roles, start the deployment manually: open **GitHub repository → Actions → Build and deploy nginx site → Run workflow**, select the branch, and confirm **Run workflow**. The workflow is configured not to run on pushes to any branch.
 
 The workflow builds an image tagged with the commit SHA, pushes it to ACR, applies the internal controller manifest, and runs `helm upgrade --install` in namespace `web`. It prints the website resources and controller load-balancer Service at the end. See [HELM-INGRESS-GUIDE.md](./HELM-INGRESS-GUIDE.md) for a step-by-step explanation of the chart templates and workflow.
 
@@ -535,7 +597,7 @@ kubectl get events --all-namespaces --sort-by=.lastTimestamp
 
 ### Redeploy, roll back, and uninstall the website
 
-To redeploy, push a change to `main` or run **Actions → Build and deploy nginx site → Run workflow**. The workflow uses the commit SHA as the image tag, so each deployment points the chart to that build. Check the Actions run for failures and use the health checks above afterward.
+To redeploy, open **GitHub repository → Actions → Build and deploy nginx site → Run workflow**, select the branch containing the code to deploy, and confirm **Run workflow**. Pushes to branches do not start a deployment. The workflow uses the selected commit's SHA as the image tag, so each deployment points the chart to that build. Check the Actions run for failures and use the health checks above afterward.
 
 List Helm releases and revisions:
 
