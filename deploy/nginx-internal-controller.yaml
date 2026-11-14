@@ -5,5 +5,7 @@ metadata:
 spec:
   ingressClassName: nginx-internal
   controllerNamePrefix: nginx-internal
+  scaling:
+    minReplicas: 1
   loadBalancerAnnotations:
     service.beta.kubernetes.io/azure-load-balancer-internal: "true"

@@ -100,6 +100,21 @@ resource "azurerm_kubernetes_cluster" "aks" {
   }
 }
 
+resource "azurerm_kubernetes_cluster_node_pool" "workload" {
+  name                  = "workload"
+  kubernetes_cluster_id = azurerm_kubernetes_cluster.aks.id
+  vm_size               = var.node_vm_size
+  node_count            = 1
+  mode                  = "User"
+  vnet_subnet_id        = azurerm_subnet.aks.id
+
+  upgrade_settings {
+    max_surge                     = "10%"
+    drain_timeout_in_minutes      = 0
+    node_soak_duration_in_minutes = 0
+  }
+}
+
 resource "azurerm_role_assignment" "aks_acr_pull" {
   scope                            = azurerm_container_registry.aks.id
   role_definition_name             = "AcrPull"
