@@ -9,6 +9,7 @@ For a beginner-friendly, file-by-file explanation of the Helm chart, website Ing
 - [Project at a glance](#project-at-a-glance)
 - [Prerequisites](#prerequisites)
 - [Provision AKS and ACR](#provision-aks-and-acr)
+- [Enable monitoring](#enable-monitoring)
 - [Configure GitHub Actions](#configure-github-actions)
 - [Internal access](#internal-access)
 - [Operate and troubleshoot](#operate-and-troubleshoot)
@@ -21,6 +22,7 @@ This repository provisions and deploys a small private website. The major compon
 | Component | What it does | Managed/configured by |
 |---|---|---|
 | Resource group, VNet, subnet, AKS, ACR, identities, role assignments | Azure infrastructure and cluster access | Terraform |
+| Log Analytics, Azure Monitor workspace, collection rule, and Managed Grafana | AKS container logs and Prometheus metrics | Terraform in `monitoring.tf` |
 | `system` node pool | Runs Kubernetes system components and workloads | Terraform, through `node_count` and `node_vm_size` |
 | `workload` node pool | Adds compute capacity for workloads | Terraform, currently one node in `main.tf` |
 | Application-routing add-on and `app-routing-system` namespace | Provides the managed NGINX ingress controller platform | AKS |
@@ -96,6 +98,26 @@ az aks nodepool list \
   --output table
 kubectl get nodes -o wide
 ```
+
+## Enable monitoring
+
+Monitoring is provisioned with the AKS cluster in [monitoring.tf](./monitoring.tf):
+
+```text
+AKS Azure Monitor agent
+  -> container logs -> Log Analytics workspace
+  -> Prometheus metrics -> Azure Monitor workspace -> Azure Managed Grafana
+```
+
+The `oms_agent` block in [main.tf](./main.tf) sends container logs to Log Analytics. The `monitor_metrics` block enables Managed Prometheus; the collection endpoint, rule, and association route those metrics to the Azure Monitor workspace. Grafana is linked to that workspace and receives the `Monitoring Reader` role so it can query metrics.
+
+Run the existing Terraform commands (`terraform init`, `terraform plan`, then `terraform apply`) to create monitoring with the cluster. The Azure account running Terraform needs permission to create the resources and assign the Grafana role (typically Contributor plus User Access Administrator, or equivalent). Open the Grafana URL with:
+
+```bash
+terraform output -raw grafana_endpoint
+```
+
+This keeps the monitoring components simple and managed by Azure, but it does not reproduce the image's Private Link Scope, private endpoints, or private DNS zones. The Grafana and monitoring workspaces use their public Azure endpoints; access is controlled by Azure authentication and RBAC. Add private endpoints and DNS only if your network policy requires private-only access. Log ingestion and Managed Grafana incur Azure charges.
 
 ## Configure GitHub Actions
 
@@ -626,7 +648,7 @@ Do not run `terraform destroy` unless you intend to delete Terraform-managed Azu
 
 | Path | Purpose |
 |---|---|
-| `main.tf`, `variables.tf`, `outputs.tf`, `versions.tf` | Azure resources and Terraform configuration. |
+| `main.tf`, `monitoring.tf`, `variables.tf`, `outputs.tf`, `versions.tf` | AKS, monitoring, and Terraform configuration. |
 | `terraform.tfvars.example` | Safe-to-commit sample input values. Copy it to ignored `terraform.tfvars` and fill in your own values. |
 | `.gitignore` | Excludes Terraform state and actual `.tfvars` files. |
 | `.github/workflows/deploy.yml` | Image build/push and AKS deployment workflow. |

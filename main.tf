@@ -57,6 +57,16 @@ resource "azurerm_kubernetes_cluster" "aks" {
     dns_zone_ids             = []
     default_nginx_controller = "None"
   }
+
+  monitor_metrics {
+    annotations_allowed = null
+    labels_allowed      = null
+  }
+
+  oms_agent {
+    log_analytics_workspace_id = azurerm_log_analytics_workspace.monitoring.id
+  }
+
   oidc_issuer_enabled       = true
   workload_identity_enabled = true
 

@@ -32,3 +32,18 @@ output "acr_login_server" {
   description = "Login server for the Azure Container Registry."
   value       = azurerm_container_registry.aks.login_server
 }
+
+output "log_analytics_workspace_id" {
+  description = "Resource ID of the Log Analytics workspace used for AKS logs."
+  value       = azurerm_log_analytics_workspace.monitoring.id
+}
+
+output "azure_monitor_workspace_id" {
+  description = "Resource ID of the Azure Monitor workspace used for Prometheus metrics."
+  value       = azurerm_monitor_workspace.monitoring.id
+}
+
+output "grafana_endpoint" {
+  description = "URL of the Azure Managed Grafana workspace."
+  value       = azurerm_dashboard_grafana.monitoring.endpoint
+}
