@@ -3,6 +3,8 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: {{ printf "%s-appgw" (include "nginx-site.fullname" .) | trunc 63 | trimSuffix "-" }}
+  annotations:
+    appgw.ingress.kubernetes.io/use-private-ip: "true"
   labels:
     {{- include "nginx-site.labels" . | nindent 4 }}
 spec:

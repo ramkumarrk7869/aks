@@ -196,7 +196,7 @@ The first output should be `true`; the controller pod should be `Running` and `1
 
 ## Test the Application Gateway route in parallel
 
-The Helm chart can create a second Ingress for AGIC while keeping the existing `nginx-internal` Ingress. Both use the same host, path, and website Service, but each controller handles only its own Ingress class. The GitHub Actions workflow enables this test Ingress on deployment. It uses `azure-application-gateway`, the AGIC add-on's Ingress class.
+The Helm chart can create a second Ingress for AGIC while keeping the existing `nginx-internal` Ingress. Both use the same host, path, and website Service, but each controller handles only its own Ingress class. The GitHub Actions workflow enables this test Ingress on deployment. It uses `azure-application-gateway`, the AGIC add-on's Ingress class, and the `appgw.ingress.kubernetes.io/use-private-ip: "true"` annotation because this gateway has only a private frontend.
 
 1. Run **Build and deploy nginx site** from GitHub Actions on the branch containing these changes. The workflow deploys the website as before and creates the additional AGIC Ingress. It does not change the existing NGINX Ingress or DNS.
 2. From a VM that can reach both the private AKS API and the Application Gateway subnet/VNet, confirm both Ingress objects exist and have their intended classes:
@@ -205,7 +205,7 @@ The Helm chart can create a second Ingress for AGIC while keeping the existing `
    kubectl get ingress -n web -o wide
    ```
 
-   Expect one Ingress with class `nginx-internal` and another with class `azure-application-gateway`.
+   Expect one Ingress with class `nginx-internal` and another with class `azure-application-gateway`. The AGIC Ingress `ADDRESS` can remain blank while AGIC is reconciling; use the Application Gateway's private IP from `terraform output -raw application_gateway_private_ip` for the direct test below.
 3. Test the Application Gateway directly, bypassing DNS. Use the same hostname configured in the GitHub Actions `NGINX_HOST` secret:
 
    ```bash
@@ -724,6 +724,8 @@ If a pod has `Insufficient cpu` events, first confirm the pod's request and each
 | Application Gateway reports `ApplicationGatewayFeatureCannotBeEnabledForSelectedSku` for private-only `Standard_v2` | Subscription feature registration | Register `EnableApplicationGatewayNetworkIsolation` for `Microsoft.Network`, wait for `Registered`, then re-register the provider and rerun Terraform. See [resolved errors](#resolved-errors). |
 | AGIC pod is `Running` but not `Ready`, restarts, and logs show `ErrorApplicationGatewayForbidden` | AGIC Azure RBAC | Grant the add-on identity `Contributor` on the Application Gateway and `Reader` on its resource group. These assignments are managed in [application_gateway.tf](./application_gateway.tf). |
 | AGIC pod events show `ApplicationGatewayInsufficientPermissionOnSubnet` | AGIC subnet permissions | Grant its identity `Network Contributor` on the dedicated Application Gateway subnet. This is managed in [application_gateway.tf](./application_gateway.tf). |
+| AGIC Ingress has a blank `ADDRESS` | AGIC reconciliation | Use the private IP from `terraform output -raw application_gateway_private_ip`; check AGIC logs and Application Gateway backend health if the direct Host-header test fails. |
+| AGIC Ingress event says `NoPublicIP` and Application Gateway returns `502` | Private frontend selection | Add `appgw.ingress.kubernetes.io/use-private-ip: "true"` to the AGIC Ingress. The Helm template sets this for the private-only gateway. |
 
 Useful focused checks:
 
@@ -770,6 +772,14 @@ kubectl logs --namespace kube-system deployment/ingress-appgw-deployment
 
 The pod log command without `-n kube-system` initially returned `NotFound` because `kubectl logs` defaults to the `default` namespace. Specify `--namespace kube-system` for this add-on.
 
+#### `kubectl describe ingress` returns `NotFound`
+
+**Cause and resolution:** `kubectl describe ingress <name>` searches the current namespace, which is often `default`. The website Ingress is in namespace `web`; specify it explicitly:
+
+```bash
+kubectl describe ingress nginx-site-nginx-site-appgw --namespace web
+```
+
 #### AGIC cannot join the Application Gateway subnet
 
 **Error:** The pod event reports `ApplicationGatewayInsufficientPermissionOnSubnet` and says the AGIC identity lacks `Microsoft.Network/virtualNetworks/subnets/join/action` on the Application Gateway subnet.
@@ -782,6 +792,23 @@ The pod log command without `-n kube-system` initially returned `NotFound` becau
 kubectl get events -n kube-system --sort-by=.lastTimestamp
 kubectl logs -n kube-system deployment/ingress-appgw-deployment --tail=50
 ```
+
+#### AGIC ignores an Ingress on a private-only gateway
+
+**Error:** The Ingress event reports `NoPublicIP`, says the gateway needs a public IP or the private-IP annotation, and a request to the gateway returns `502 Bad Gateway`.
+
+**Cause:** This Application Gateway intentionally has only a private frontend. AGIC needs the Ingress to opt in to that private frontend.
+
+**Fix:** The [AGIC test Ingress template](./charts/nginx-site/templates/ingress-application-gateway.yaml) sets `appgw.ingress.kubernetes.io/use-private-ip: "true"`. For an immediate live fix before the updated chart is deployed, run:
+
+```bash
+kubectl annotate ingress nginx-site-nginx-site-appgw \
+  --namespace web \
+  appgw.ingress.kubernetes.io/use-private-ip="true" \
+  --overwrite
+```
+
+Then redeploy the updated chart through GitHub Actions so Helm keeps the annotation. Confirm the `NoPublicIP` event stops appearing and retest the private gateway IP with the hostname in the `Host` header.
 
 #### Grafana major version rejected by the AzureRM provider
 

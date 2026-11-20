@@ -300,7 +300,7 @@ spec:
 
 ### `charts/nginx-site/templates/ingress-application-gateway.yaml`
 
-This optional template sends the same host and path to the same website Service, but selects the AGIC add-on with `ingressClassName: azure-application-gateway`. It creates a separate Ingress object, so NGINX can continue serving its existing Ingress while AGIC configures the Application Gateway route. Test the gateway directly by private IP and a matching `Host` header before changing DNS.
+This optional template sends the same host and path to the same website Service, but selects the AGIC add-on with `ingressClassName: azure-application-gateway`. It sets `appgw.ingress.kubernetes.io/use-private-ip: "true"` because this project provisions a private-only Application Gateway. It creates a separate Ingress object, so NGINX can continue serving its existing Ingress while AGIC configures the Application Gateway route. Test the gateway directly by private IP and a matching `Host` header before changing DNS.
 
 ## 5. The internal ingress controller
 
