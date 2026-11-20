@@ -67,6 +67,10 @@ resource "azurerm_kubernetes_cluster" "aks" {
     log_analytics_workspace_id = azurerm_log_analytics_workspace.monitoring.id
   }
 
+  ingress_application_gateway {
+    gateway_id = azurerm_application_gateway.aks.id
+  }
+
   oidc_issuer_enabled       = true
   workload_identity_enabled = true
 

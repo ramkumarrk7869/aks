@@ -47,3 +47,13 @@ output "grafana_endpoint" {
   description = "URL of the Azure Managed Grafana workspace."
   value       = azurerm_dashboard_grafana.monitoring.endpoint
 }
+
+output "application_gateway_id" {
+  description = "Resource ID of the private Application Gateway."
+  value       = azurerm_application_gateway.aks.id
+}
+
+output "application_gateway_private_ip" {
+  description = "Private frontend IP address of the Application Gateway."
+  value       = var.application_gateway_private_ip
+}

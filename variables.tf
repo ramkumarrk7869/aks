@@ -63,6 +63,18 @@ variable "aks_subnet_address_prefixes" {
   default     = ["10.20.0.0/22"]
 }
 
+variable "application_gateway_subnet_prefix" {
+  description = "Dedicated /24 subnet for Application Gateway. Must be unused and within the VNet address space."
+  type        = string
+  default     = "10.20.4.0/24"
+}
+
+variable "application_gateway_private_ip" {
+  description = "Static private frontend IP for Application Gateway, inside its dedicated subnet."
+  type        = string
+  default     = "10.20.4.250"
+}
+
 variable "pod_cidr" {
   description = "Pod address range for Azure CNI Overlay; must not overlap the VNet or service CIDR."
   type        = string

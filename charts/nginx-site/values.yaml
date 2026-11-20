@@ -14,3 +14,6 @@ ingress:
   host: nginx.internal.example.com
   path: /
   pathType: Prefix
+  applicationGateway:
+    enabled: false
+    className: azure-application-gateway

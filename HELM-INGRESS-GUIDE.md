@@ -55,6 +55,7 @@ The Ingress is only a rule; it does not run a web server by itself. The controll
 | `charts/nginx-site/templates/deployment.yaml` | Defines the website pods. |
 | `charts/nginx-site/templates/service.yaml` | Defines the stable in-cluster Service for those pods. |
 | `charts/nginx-site/templates/ingress.yaml` | Defines the HTTP host/path routing rule. |
+| `charts/nginx-site/templates/ingress-application-gateway.yaml` | Optionally adds a parallel AGIC route for migration testing. |
 | `main.tf` | Enables AKS application routing and configures the AKS node pools. |
 
 ## 3. The web page and container image
@@ -132,6 +133,9 @@ ingress:
   host: nginx.internal.example.com
   path: /
   pathType: Prefix
+  applicationGateway:
+    enabled: false
+    className: azure-application-gateway
 ```
 
 - `replicaCount: 2` asks Kubernetes to run two website pods.
@@ -142,6 +146,7 @@ ingress:
 - `ingress.className` selects the internal ingress controller.
 - `host` and `path` describe which web requests should match the Ingress. The workflow supplies the configured `NGINX_HOST` value for the host.
 - `pathType: Prefix` means `/` and paths below it match this rule.
+- `ingress.applicationGateway.enabled` optionally creates a second Ingress using the `azure-application-gateway` class. The deployment workflow enables it for a side-by-side migration test; the existing NGINX Ingress remains unchanged.
 
 The default image and hostname are fallback values. During the actual Actions deployment, the workflow provides the ACR image and configured host explicitly.
 
@@ -292,6 +297,10 @@ spec:
 - `backend.service` points to the website Service and its port.
 - The Ingress does not create DNS and does not itself allocate a load balancer. DNS and the controller's load balancer are separate parts.
 - `quote` makes the rendered host a quoted YAML string, which helps avoid YAML parsing ambiguity.
+
+### `charts/nginx-site/templates/ingress-application-gateway.yaml`
+
+This optional template sends the same host and path to the same website Service, but selects the AGIC add-on with `ingressClassName: azure-application-gateway`. It creates a separate Ingress object, so NGINX can continue serving its existing Ingress while AGIC configures the Application Gateway route. Test the gateway directly by private IP and a matching `Host` header before changing DNS.
 
 ## 5. The internal ingress controller
 

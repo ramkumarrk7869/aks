@@ -73,6 +73,7 @@ jobs:
             --set-string image.repository="$ACR_LOGIN_SERVER/$IMAGE_NAME" \
             --set-string image.tag="$IMAGE_TAG" \
             --set-string ingress.host="$NGINX_HOST" \
+            --set ingress.applicationGateway.enabled=true \
             --wait \
             --timeout 5m
 

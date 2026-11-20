@@ -10,6 +10,8 @@ For a beginner-friendly, file-by-file explanation of the Helm chart, website Ing
 - [Prerequisites](#prerequisites)
 - [Provision AKS and ACR](#provision-aks-and-acr)
 - [Enable monitoring](#enable-monitoring)
+- [Stage the private Application Gateway](#stage-the-private-application-gateway)
+- [Test the Application Gateway route in parallel](#test-the-application-gateway-route-in-parallel)
 - [Configure GitHub Actions](#configure-github-actions)
 - [Internal access](#internal-access)
 - [Operate and troubleshoot](#operate-and-troubleshoot)
@@ -23,12 +25,13 @@ This repository provisions and deploys a small private website. The major compon
 |---|---|---|
 | Resource group, VNet, subnet, AKS, ACR, identities, role assignments | Azure infrastructure and cluster access | Terraform |
 | Log Analytics, Azure Monitor workspace, collection rule, and Managed Grafana | AKS container logs and Prometheus metrics | Terraform in `monitoring.tf` |
+| Private Application Gateway v2 and AGIC add-on | Staged replacement ingress; parallel route is tested before private DNS cutover | Terraform in `application_gateway.tf` and `main.tf` |
 | `system` node pool | Runs Kubernetes system components and workloads | Terraform, through `node_count` and `node_vm_size` |
 | `workload` node pool | Adds compute capacity for workloads | Terraform, currently one node in `main.tf` |
 | Application-routing add-on and `app-routing-system` namespace | Provides the managed NGINX ingress controller platform | AKS |
 | Default NGINX controller | Disabled because this project does not use its `webapprouting.kubernetes.azure.com` class or public load balancer | `web_app_routing.default_nginx_controller = "None"` in `main.tf` |
 | `nginx-internal` controller configuration | Requests a private load balancer and sets the controller's minimum replica count | `deploy/nginx-internal-controller.yaml`, applied by GitHub Actions |
-| Website Deployment, Service, and Ingress | Runs the website and routes matching HTTP requests | Helm chart in `charts/nginx-site`, installed by GitHub Actions |
+| Website Deployment, Service, and NGINX/AGIC Ingresses | Runs the website and keeps a parallel AGIC route for migration testing | Helm chart in `charts/nginx-site`, installed by GitHub Actions |
 | Container image | NGINX plus `site/index.html` | Dockerfile, pushed to ACR by GitHub Actions |
 
 The website's request path uses the dedicated internal controller; the unused default controller is not part of this path:
@@ -119,9 +122,113 @@ terraform output -raw grafana_endpoint
 
 This keeps the monitoring components simple and managed by Azure, but it does not reproduce the image's Private Link Scope, private endpoints, or private DNS zones. The Grafana and monitoring workspaces use their public Azure endpoints; access is controlled by Azure authentication and RBAC. Add private endpoints and DNS only if your network policy requires private-only access. Log ingestion and Managed Grafana incur Azure charges.
 
+### Check monitoring after deployment
+
+1. Apply the Terraform changes and wait a few minutes for Azure Monitor to start collecting data.
+2. In the Azure portal, open the AKS resource and select **Insights** to check cluster and workload health. Open the Log Analytics workspace and select **Logs** to query collected container logs. For example:
+
+   ```kusto
+   ContainerLogV2
+   | where TimeGenerated > ago(30m)
+   | project TimeGenerated, PodNamespace, PodName, ContainerName, LogMessage
+   | sort by TimeGenerated desc
+   | take 50
+   ```
+
+3. Check that the agents are running. Because this AKS cluster is private, run `kubectl` from a machine that can reach its private API endpoint:
+
+   ```powershell
+   az aks get-credentials --resource-group (terraform output -raw resource_group_name) --name (terraform output -raw cluster_name)
+   kubectl get nodes
+   kubectl get pods --namespace kube-system | Select-String "ama-"
+   ```
+
+4. Open the Grafana endpoint:
+
+   ```powershell
+   terraform output -raw grafana_endpoint
+   ```
+
+   Sign in with Microsoft Entra ID. Your user needs the **Azure Managed Grafana Viewer** role (or a higher Grafana role) to open dashboards. The `Monitoring Reader` role in Terraform is assigned to Grafana's managed identity so it can query metrics; it does not grant your user access to Grafana.
+
+5. In Grafana, open **Explore**, choose the Prometheus data source for the linked Azure Monitor workspace, and try `up` or `kube_node_info`. Seeing results confirms Prometheus metrics are arriving. Use the dashboard browser to open or create Kubernetes dashboards.
+
+If logs or metrics are empty, confirm the Terraform apply completed, the `ama-` pods are healthy, the DCR association exists on the AKS resource, and the Azure Monitor workspace is linked to Grafana. Allow a few minutes after initial deployment for data to appear.
+
+## Stage the private Application Gateway
+
+This is the infrastructure-only first step of moving from the internal NGINX ingress to the stable **Application Gateway v2 + AGIC add-on**. It creates a private-only Standard_v2 gateway, a dedicated subnet, and enables the AKS-managed AGIC add-on. The website Ingress and NGINX controller are intentionally unchanged, so website traffic still uses NGINX until a later cutover.
+
+The default network settings use `10.20.0.0/16` for the VNet and `10.20.0.0/22` for AKS. The gateway uses `10.20.4.0/24` and frontend IP `10.20.4.250` by default. Check that the subnet is unused and both addresses fit your actual VNet before applying. Override them in ignored `terraform.tfvars` if needed:
+
+```hcl
+application_gateway_subnet_prefix = "10.20.4.0/24"
+application_gateway_private_ip    = "10.20.4.250"
+```
+
+Before creating a private-only v2 gateway, register the required Azure feature once for the subscription. This enables the production-supported private Application Gateway capability; the portal may label the opt-in flow as a preview feature:
+
+```powershell
+az feature register --name EnableApplicationGatewayNetworkIsolation --namespace Microsoft.Network
+az feature show --name EnableApplicationGatewayNetworkIsolation --namespace Microsoft.Network --query properties.state -o tsv
+```
+
+Wait until the state is `Registered`, then refresh the network resource provider:
+
+```powershell
+az provider register --namespace Microsoft.Network
+```
+
+Run `terraform plan` and verify the AKS cluster is updated in place, not replaced. After reviewing the plan, apply it. The Azure identity running Terraform must be allowed to create the gateway/network resources and the AGIC add-on role assignments.
+
+From a machine with access to the private AKS API, check that the add-on is enabled, its controller pod is running, and the gateway is operational:
+
+```powershell
+$rg = terraform output -raw resource_group_name
+$cluster = terraform output -raw cluster_name
+az aks show --resource-group $rg --name $cluster --query addonProfiles.ingressApplicationGateway.enabled -o tsv
+kubectl get pods --namespace kube-system | Select-String "ingress-appgw"
+az network application-gateway show --resource-group $rg --name "$cluster-appgw" --query operationalState -o tsv
+terraform output -raw application_gateway_private_ip
+```
+
+The first output should be `true`; the controller pod should be `Running` and `1/1 Ready`; the gateway should report `Running`; and the final command prints its private frontend IP. At this stage the website is **not** routed through the gateway yet. Test AGIC with a second Ingress while the existing NGINX Ingress and DNS remain unchanged, as described in [Test the Application Gateway route in parallel](#test-the-application-gateway-route-in-parallel). Terraform ignores AGIC-managed listeners and backend rules so later plans don't overwrite the configuration AGIC creates.
+
+## Test the Application Gateway route in parallel
+
+The Helm chart can create a second Ingress for AGIC while keeping the existing `nginx-internal` Ingress. Both use the same host, path, and website Service, but each controller handles only its own Ingress class. The GitHub Actions workflow enables this test Ingress on deployment. It uses `azure-application-gateway`, the AGIC add-on's Ingress class.
+
+1. Run **Build and deploy nginx site** from GitHub Actions on the branch containing these changes. The workflow deploys the website as before and creates the additional AGIC Ingress. It does not change the existing NGINX Ingress or DNS.
+2. From a VM that can reach both the private AKS API and the Application Gateway subnet/VNet, confirm both Ingress objects exist and have their intended classes:
+
+   ```bash
+   kubectl get ingress -n web -o wide
+   ```
+
+   Expect one Ingress with class `nginx-internal` and another with class `azure-application-gateway`.
+3. Test the Application Gateway directly, bypassing DNS. Use the same hostname configured in the GitHub Actions `NGINX_HOST` secret:
+
+   ```bash
+   APPGW_IP="$(terraform output -raw application_gateway_private_ip)"
+   NGINX_HOST="<your NGINX_HOST value>"
+   curl -i --connect-timeout 5 -H "Host: $NGINX_HOST" "http://$APPGW_IP/"
+   ```
+
+   Expect the website response. If the request fails, check the AGIC logs and Application Gateway backend health before changing DNS:
+
+   ```bash
+   kubectl logs -n kube-system deployment/ingress-appgw-deployment --tail=100
+   az network application-gateway show-backend-health \
+     --resource-group "$(terraform output -raw resource_group_name)" \
+     --name "$(terraform output -raw cluster_name)-appgw" \
+     --output table
+   ```
+
+Once the direct test succeeds, plan the DNS change to point the website hostname to the Application Gateway's private IP. Keep NGINX and its internal load balancer available during DNS propagation as a rollback option. After clients consistently reach the site through Application Gateway, switch the chart's primary Ingress to AGIC, disable the temporary parallel Ingress, and remove the unused NGINX controller in a separate reviewed change. Do not remove NGINX before the Application Gateway route and DNS cutover are verified.
+
 ## Configure GitHub Actions
 
-The workflow at `.github/workflows/deploy.yml` builds and pushes the image to ACR, then deploys the website and a Kubernetes `Ingress` resource with Helm. AKS application routing manages an internal NGINX ingress controller and internal Azure Load Balancer for the `nginx-internal` ingress class.
+The workflow at `.github/workflows/deploy.yml` builds and pushes the image to ACR, then deploys the website and its NGINX and AGIC Kubernetes `Ingress` resources with Helm. During this migration test, AKS application routing continues to manage the internal NGINX ingress controller and internal Azure Load Balancer for the `nginx-internal` class; AGIC separately configures the Application Gateway route.
 
 > **Support lifecycle:** This project currently uses AKS-managed NGINX Ingress. Upstream ingress-nginx maintenance ended in March 2026, and Microsoft's stated support for the AKS-managed NGINX Ingress resources ends in November 2026. This is a short-lived/learning setup, not a recommended long-term ingress choice. Before continuing to rely on it, check Microsoft's current support notice and plan migration to Gateway API or Application Gateway for Containers. See the [AKS application routing documentation](https://learn.microsoft.com/azure/aks/app-routing).
 
@@ -351,11 +458,17 @@ gh secret set NGINX_HOST --repo "${OWNER}/${REPO}" --body "$NGINX_HOST"
 
 After enabling the add-on, setting up the runner, and granting roles, start the deployment manually: open **GitHub repository → Actions → Build and deploy nginx site → Run workflow**, select the branch, and confirm **Run workflow**. The workflow is configured not to run on pushes to any branch.
 
-The workflow builds an image tagged with the commit SHA, pushes it to ACR, applies the internal controller manifest, and runs `helm upgrade --install` in namespace `web`. It prints the website resources and controller load-balancer Service at the end. See [HELM-INGRESS-GUIDE.md](./HELM-INGRESS-GUIDE.md) for a step-by-step explanation of the chart templates and workflow.
+The workflow builds an image tagged with the commit SHA, pushes it to ACR, gets AKS credentials, applies `deploy/nginx-internal-controller.yaml`, and deploys the chart to namespace `web` with `helm upgrade --install`. The Helm command passes the configured ACR image, image tag, and `NGINX_HOST`, and includes:
+
+```bash
+--set ingress.applicationGateway.enabled=true
+```
+
+That flag creates the second Ingress using class `azure-application-gateway`; the existing Ingress remains on `nginx-internal`. Both route the same host and path to the website Service. The workflow then prints the Deployment, Service, and both Ingresses. This does **not** change DNS or remove the NGINX controller. To verify the parallel route, follow [Test the Application Gateway route in parallel](#test-the-application-gateway-route-in-parallel). See [HELM-INGRESS-GUIDE.md](./HELM-INGRESS-GUIDE.md) for a step-by-step explanation of the chart templates and workflow.
 
 ## Internal access
 
-The Helm chart creates an `Ingress` for `NGINX_HOST` using the `nginx-internal` class. Its controller requests an internal Azure Load Balancer, so the endpoint is not public. After deployment, inspect the Ingress and controller with:
+During the migration test, the chart creates two Ingresses for `NGINX_HOST`: the existing `nginx-internal` route and the parallel `azure-application-gateway` route. The current NGINX controller still has its internal Azure Load Balancer, and DNS remains unchanged. Inspect both routes and the NGINX controller with:
 
 ```bash
 kubectl get ingress --namespace web
@@ -365,6 +478,8 @@ kubectl get service --namespace app-routing-system \
 ```
 
 The `IP` column is the controller's load balancer IP. Wait for it to be assigned; it should be a private address. For Azure Private DNS, create a private zone for your organization's internal DNS suffix, link it to the AKS VNet (and any client VNets that need to resolve it), and create an A record. Replace the example domain with a DNS zone that your organization controls. The following example makes `nginx.internal.example.com` resolve to the private ingress IP:
+
+The DNS example below is for the original NGINX endpoint. During the AGIC test, leave the existing DNS record unchanged. After the direct Application Gateway test succeeds, update the existing A record to the Application Gateway's private IP as described in [Test the Application Gateway route in parallel](#test-the-application-gateway-route-in-parallel).
 
 ```bash
 RESOURCE_GROUP="$(terraform output -raw resource_group_name)"
@@ -566,7 +681,7 @@ kubectl describe pods --namespace web
 kubectl describe pods --namespace app-routing-system
 ```
 
-Expected steady state: website pods and ingress controller pod(s) are `Running` and ready; the website Ingress has the intended host and `nginx-internal` class; and the `nginx-internal-0` Service has a private IP rather than `<pending>`. Use the direct IP + Host-header curl in [Internal access](#internal-access) to separate DNS issues from load-balancer/routing issues.
+Expected steady state during the parallel migration test: website and controller pods are `Running` and ready; `kubectl get ingress -n web -o wide` shows both `nginx-internal` and `azure-application-gateway` classes; and the `nginx-internal-0` Service has a private IP rather than `<pending>`. Test the Application Gateway with its private IP and a matching Host header using [Test the Application Gateway route in parallel](#test-the-application-gateway-route-in-parallel). Keep NGINX until the gateway route and DNS cutover are verified.
 
 ### CPU usage, requests, limits, and node capacity
 
@@ -606,6 +721,9 @@ If a pod has `Insufficient cpu` events, first confirm the pod's request and each
 | Curl by IP works but hostname does not | DNS | Confirm the private A record points to the current IP, the client can resolve the zone, and VNet linking/conditional forwarding is configured. |
 | Website Service port-forward works but Ingress test fails | Ingress/controller rule | Verify controller is Ready, the Ingress host/class match, and the backend Service has endpoints. |
 | `kubectl top` says Metrics API is unavailable | Metrics API | This prevents usage metrics, but not inspection of requests or scheduler events. Check `kubectl describe nodes` and pod events. |
+| Application Gateway reports `ApplicationGatewayFeatureCannotBeEnabledForSelectedSku` for private-only `Standard_v2` | Subscription feature registration | Register `EnableApplicationGatewayNetworkIsolation` for `Microsoft.Network`, wait for `Registered`, then re-register the provider and rerun Terraform. See [resolved errors](#resolved-errors). |
+| AGIC pod is `Running` but not `Ready`, restarts, and logs show `ErrorApplicationGatewayForbidden` | AGIC Azure RBAC | Grant the add-on identity `Contributor` on the Application Gateway and `Reader` on its resource group. These assignments are managed in [application_gateway.tf](./application_gateway.tf). |
+| AGIC pod events show `ApplicationGatewayInsufficientPermissionOnSubnet` | AGIC subnet permissions | Grant its identity `Network Contributor` on the dedicated Application Gateway subnet. This is managed in [application_gateway.tf](./application_gateway.tf). |
 
 Useful focused checks:
 
@@ -616,6 +734,60 @@ kubectl get service --namespace app-routing-system
 kubectl describe nginxingresscontroller nginx-internal
 kubectl get events --all-namespaces --sort-by=.lastTimestamp
 ```
+
+### Resolved errors
+
+Keep errors encountered during provisioning or operation here with the cause and verified resolution. Append new entries instead of replacing earlier ones.
+
+#### Private-only Application Gateway rejected for `Standard_v2`
+
+**Error:** `ApplicationGatewayFeatureCannotBeEnabledForSelectedSku`. Azure rejected the private-only frontend for `Standard_v2` and reported that private-only deployment wasn't supported for the selected SKU.
+
+**Cause:** The subscription's `Microsoft.Network/EnableApplicationGatewayNetworkIsolation` feature had not been registered. Private-only Application Gateway v2 is production-supported, but the subscription must opt in to this feature first.
+
+**Resolution:** Register the feature, wait until it reports `Registered` (this can take up to 30 minutes), and re-register the network provider:
+
+```powershell
+az feature register --name EnableApplicationGatewayNetworkIsolation --namespace Microsoft.Network
+az feature show --name EnableApplicationGatewayNetworkIsolation --namespace Microsoft.Network --query properties.state -o tsv
+az provider register --namespace Microsoft.Network
+```
+
+Then review and rerun `terraform plan` and `terraform apply`. The Application Gateway subnet had already been created successfully when this error occurred; keep it in Terraform state and let Terraform retry the gateway resource.
+
+#### AGIC controller gets 403 when reading Application Gateway
+
+**Error:** The `ingress-appgw-deployment` pod was `Running` but not `Ready`, repeatedly restarted, and its logs showed `ErrorApplicationGatewayForbidden` / `AuthorizationFailed` for `Microsoft.Network/applicationGateways/read`. The message named the missing `Reader` role on `rg-private-aks` and `Contributor` role on `aks-private-appgw`.
+
+**Cause:** The AGIC add-on's managed identity did not have permission to read and update the Application Gateway.
+
+**Resolution:** [application_gateway.tf](./application_gateway.tf) now assigns `Contributor` to that identity on the gateway and `Reader` on the resource group. Run `terraform plan`, verify it only adds these role assignments (and does not replace the cluster or gateway), then `terraform apply`. Allow time for role assignments to propagate; check the controller pod and logs again:
+
+```bash
+kubectl get pods --namespace kube-system | grep ingress-appgw
+kubectl logs --namespace kube-system deployment/ingress-appgw-deployment
+```
+
+The pod log command without `-n kube-system` initially returned `NotFound` because `kubectl logs` defaults to the `default` namespace. Specify `--namespace kube-system` for this add-on.
+
+#### AGIC cannot join the Application Gateway subnet
+
+**Error:** The pod event reports `ApplicationGatewayInsufficientPermissionOnSubnet` and says the AGIC identity lacks `Microsoft.Network/virtualNetworks/subnets/join/action` on the Application Gateway subnet.
+
+**Cause:** The gateway and resource-group roles do not grant the AGIC identity permission to join the dedicated subnet.
+
+**Fix:** [application_gateway.tf](./application_gateway.tf) now grants that identity `Network Contributor` scoped only to `azurerm_subnet.application_gateway`. Run `terraform plan`, confirm it adds the subnet role assignment without replacing the cluster or gateway, then apply. Allow Azure RBAC time to propagate; AGIC should retry automatically. Check recent events and logs with:
+
+```bash
+kubectl get events -n kube-system --sort-by=.lastTimestamp
+kubectl logs -n kube-system deployment/ingress-appgw-deployment --tail=50
+```
+
+#### Grafana major version rejected by the AzureRM provider
+
+**Error:** Terraform validation reported `expected grafana_major_version to be one of ["11" "12"], got 13`.
+
+**Cause and resolution:** The configured Grafana major version was not accepted by the AzureRM provider version in use. Set `grafana_major_version = 12` in [monitoring.tf](./monitoring.tf), then run `terraform validate` again.
 
 ### Redeploy, roll back, and uninstall the website
 
@@ -648,7 +820,7 @@ Do not run `terraform destroy` unless you intend to delete Terraform-managed Azu
 
 | Path | Purpose |
 |---|---|
-| `main.tf`, `monitoring.tf`, `variables.tf`, `outputs.tf`, `versions.tf` | AKS, monitoring, and Terraform configuration. |
+| `main.tf`, `application_gateway.tf`, `monitoring.tf`, `variables.tf`, `outputs.tf`, `versions.tf` | AKS, ingress gateway, monitoring, and Terraform configuration. |
 | `terraform.tfvars.example` | Safe-to-commit sample input values. Copy it to ignored `terraform.tfvars` and fill in your own values. |
 | `.gitignore` | Excludes Terraform state and actual `.tfvars` files. |
 | `.github/workflows/deploy.yml` | Image build/push and AKS deployment workflow. |
