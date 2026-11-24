@@ -75,6 +75,30 @@ variable "application_gateway_private_ip" {
   default     = "10.20.4.250"
 }
 
+variable "website_dns_zone_name" {
+  description = "Private DNS zone for the website hostname."
+  type        = string
+  default     = "internal.example.com"
+}
+
+variable "website_dns_record_name" {
+  description = "A-record name inside the website private DNS zone."
+  type        = string
+  default     = "nginx"
+}
+
+variable "website_dns_target_ip" {
+  description = "Optional DNS target override for rollback; leave null to use the Application Gateway IP."
+  type        = string
+  default     = null
+}
+
+variable "website_client_vnet_id" {
+  description = "Optional resource ID of a peered client VNet that must resolve the website private DNS name."
+  type        = string
+  default     = ""
+}
+
 variable "pod_cidr" {
   description = "Pod address range for Azure CNI Overlay; must not overlap the VNet or service CIDR."
   type        = string

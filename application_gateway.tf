@@ -72,6 +72,7 @@ resource "azurerm_application_gateway" "aks" {
 
   lifecycle {
     ignore_changes = [
+      tags,
       backend_address_pool,
       backend_http_settings,
       frontend_ip_configuration,

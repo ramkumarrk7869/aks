@@ -57,3 +57,8 @@ output "application_gateway_private_ip" {
   description = "Private frontend IP address of the Application Gateway."
   value       = var.application_gateway_private_ip
 }
+
+output "website_private_dns_fqdn" {
+  description = "Private DNS hostname for the website."
+  value       = azurerm_private_dns_a_record.website.fqdn
+}

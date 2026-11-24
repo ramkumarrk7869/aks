@@ -25,7 +25,8 @@ This repository provisions and deploys a small private website. The major compon
 |---|---|---|
 | Resource group, VNet, subnet, AKS, ACR, identities, role assignments | Azure infrastructure and cluster access | Terraform |
 | Log Analytics, Azure Monitor workspace, collection rule, and Managed Grafana | AKS container logs and Prometheus metrics | Terraform in `monitoring.tf` |
-| Private Application Gateway v2 and AGIC add-on | Staged replacement ingress; parallel route is tested before private DNS cutover | Terraform in `application_gateway.tf` and `main.tf` |
+| Private Application Gateway v2 and AGIC add-on | Serving the website through the private DNS hostname; NGINX remains available for rollback pending final cleanup | Terraform in `application_gateway.tf` and `main.tf` |
+| Website private DNS zone and A record | Resolves the website hostname to the Application Gateway private IP from linked VNets | Terraform in `dns.tf` |
 | `system` node pool | Runs Kubernetes system components and workloads | Terraform, through `node_count` and `node_vm_size` |
 | `workload` node pool | Adds compute capacity for workloads | Terraform, currently one node in `main.tf` |
 | Application-routing add-on and `app-routing-system` namespace | Provides the managed NGINX ingress controller platform | AKS |
@@ -192,7 +193,7 @@ az network application-gateway show --resource-group $rg --name "$cluster-appgw"
 terraform output -raw application_gateway_private_ip
 ```
 
-The first output should be `true`; the controller pod should be `Running` and `1/1 Ready`; the gateway should report `Running`; and the final command prints its private frontend IP. At this stage the website is **not** routed through the gateway yet. Test AGIC with a second Ingress while the existing NGINX Ingress and DNS remain unchanged, as described in [Test the Application Gateway route in parallel](#test-the-application-gateway-route-in-parallel). Terraform ignores AGIC-managed listeners and backend rules so later plans don't overwrite the configuration AGIC creates.
+The first output should be `true`; the controller pod should be `Running` and `1/1 Ready`; the gateway should report `Running`; and the final command prints its private frontend IP. Infrastructure readiness alone does not configure an application route. The separate AGIC Ingress has been tested successfully at `10.20.4.250`, and the website hostname now resolves to that IP. NGINX remains available as a rollback option while the final migration cleanup is pending. Terraform ignores AGIC-managed listeners, backend rules, and tags so later plans don't overwrite or remove AGIC's configuration.
 
 ## Test the Application Gateway route in parallel
 
@@ -224,7 +225,11 @@ The Helm chart can create a second Ingress for AGIC while keeping the existing `
      --output table
    ```
 
-Once the direct test succeeds, plan the DNS change to point the website hostname to the Application Gateway's private IP. Keep NGINX and its internal load balancer available during DNS propagation as a rollback option. After clients consistently reach the site through Application Gateway, switch the chart's primary Ingress to AGIC, disable the temporary parallel Ingress, and remove the unused NGINX controller in a separate reviewed change. Do not remove NGINX before the Application Gateway route and DNS cutover are verified.
+   **Verified 2026-11-20 (direct-IP test):** AGIC published `10.20.4.250` in the Ingress `ADDRESS`, and a request to that IP with `Host: nginx.internal.example.com` returned `HTTP/1.1 200 OK` with the website page. At that test stage, the website DNS record and NGINX controller had not been changed.
+
+**Verified 2026-11-20:** The private DNS A record resolves `nginx.internal.example.com` to `10.20.4.250` through both Azure DNS and the Linux VM's system resolver; `curl http://nginx.internal.example.com/` returned the website. The hostname cutover is complete for that VM. Confirm the same resolution and HTTP response from every required client network before removing NGINX.
+
+The chart still deploys the original `nginx-internal` Ingress and the temporary AGIC Ingress in parallel, and the NGINX controller is still running. To finish the migration, promote AGIC to the chart's primary Ingress, stop creating the temporary parallel Ingress, and then remove the NGINX controller only after the rollback window and after confirming no other workloads use it. Keep NGINX available until you are ready for that separate cleanup.
 
 ## Configure GitHub Actions
 
@@ -468,7 +473,7 @@ That flag creates the second Ingress using class `azure-application-gateway`; th
 
 ## Internal access
 
-During the migration test, the chart creates two Ingresses for `NGINX_HOST`: the existing `nginx-internal` route and the parallel `azure-application-gateway` route. The current NGINX controller still has its internal Azure Load Balancer, and DNS remains unchanged. Inspect both routes and the NGINX controller with:
+The chart currently creates two Ingresses for `NGINX_HOST`: the existing `nginx-internal` route and the parallel `azure-application-gateway` route. DNS now points the hostname to Application Gateway; the NGINX internal load balancer remains available for rollback. Inspect both routes and the NGINX controller with:
 
 ```bash
 kubectl get ingress --namespace web
@@ -477,57 +482,50 @@ kubectl get service --namespace app-routing-system \
   --output custom-columns=NAME:.metadata.name,TYPE:.spec.type,IP:.status.loadBalancer.ingress[0].ip
 ```
 
-The `IP` column is the controller's load balancer IP. Wait for it to be assigned; it should be a private address. For Azure Private DNS, create a private zone for your organization's internal DNS suffix, link it to the AKS VNet (and any client VNets that need to resolve it), and create an A record. Replace the example domain with a DNS zone that your organization controls. The following example makes `nginx.internal.example.com` resolve to the private ingress IP:
+The `IP` column is the NGINX controller's load balancer IP (`10.20.0.6` in the current cluster); keep it available for rollback. The Application Gateway route was tested at `10.20.4.250`. Terraform now manages the separate private zone `internal.example.com`, its VNet links, and the `nginx.internal.example.com` A record pointing to the Application Gateway.
 
-The DNS example below is for the original NGINX endpoint. During the AGIC test, leave the existing DNS record unchanged. After the direct Application Gateway test succeeds, update the existing A record to the Application Gateway's private IP as described in [Test the Application Gateway route in parallel](#test-the-application-gateway-route-in-parallel).
+**Do not use the AKS API server's private DNS zone for the website.** In [main.tf](./main.tf), `private_dns_zone_id = "System"` lets AKS manage its private API endpoint zone and record in the AKS node resource group. That record resolves the Kubernetes API endpoint, not `nginx.internal.example.com`; leave it unchanged.
+
+Terraform manages a separate website private DNS zone, links it to the AKS VNet and the peered client VNet, and creates the website A record. Defaults are zone `internal.example.com` and record `nginx`, matching `NGINX_HOST=nginx.internal.example.com`. The record points to the Application Gateway private IP by default. For future DNS changes, review the plan before applying:
+
+The DNS resource arguments must match the AzureRM version selected by `versions.tf`. With the provider schema used by this project, the VNet link uses `private_dns_zone_name` and `resource_group_name`, while the A record uses `zone_name` and `resource_group_name`.
 
 ```bash
-RESOURCE_GROUP="$(terraform output -raw resource_group_name)"
-CLUSTER_NAME="$(terraform output -raw cluster_name)"
-VNET_NAME="${CLUSTER_NAME}-vnet"
-DNS_ZONE="internal.example.com"
-NGINX_HOST="nginx.internal.example.com"
-RECORD_NAME="${NGINX_HOST%.$DNS_ZONE}"
-
-VNET_ID="$(az network vnet show \
-  --resource-group "$RESOURCE_GROUP" \
-  --name "$VNET_NAME" \
-  --query id --output tsv)"
-
-az network private-dns zone create \
-  --resource-group "$RESOURCE_GROUP" \
-  --name "$DNS_ZONE"
-
-az network private-dns link vnet create \
-  --resource-group "$RESOURCE_GROUP" \
-  --zone-name "$DNS_ZONE" \
-  --name "${CLUSTER_NAME}-dns-link" \
-  --virtual-network "$VNET_ID" \
-  --registration-enabled false
-
-# Read the IP from the LoadBalancer service shown by kubectl above.
-INGRESS_IP="<private-load-balancer-ip>"
-
-az network private-dns record-set a create \
-  --resource-group "$RESOURCE_GROUP" \
-  --zone-name "$DNS_ZONE" \
-  --name "$RECORD_NAME" \
-  --ttl 300
-
-az network private-dns record-set a add-record \
-  --resource-group "$RESOURCE_GROUP" \
-  --zone-name "$DNS_ZONE" \
-  --record-set-name "$RECORD_NAME" \
-  --ipv4-address "$INGRESS_IP"
-
-az network private-dns record-set a show \
-  --resource-group "$RESOURCE_GROUP" \
-  --zone-name "$DNS_ZONE" \
-  --name "$RECORD_NAME" \
-  --output table
+terraform plan
 ```
 
-For an existing zone, skip the `zone create` command. For existing VNet links, skip creating a duplicate link. Link every VNet from which clients need to resolve this private zone. If clients are on-premises or use corporate DNS, an Azure Private DNS VNet link alone is not enough: configure your organization's DNS administrators to create the A record there or configure conditional forwarding to Azure DNS through an Azure DNS Private Resolver/DNS forwarder.
+Because the Linux test VM is in a peered VNet, add its VNet resource ID to the ignored `terraform.tfvars` file:
+
+```hcl
+website_client_vnet_id = "/subscriptions/<subscription-id>/resourceGroups/<client-vnet-rg>/providers/Microsoft.Network/virtualNetworks/<client-vnet-name>"
+```
+
+Then confirm the plan creates the website private zone, its AKS VNet link, the client-VNet link, and the A record pointing to `10.20.4.250`; confirm it does not replace the AKS cluster or Application Gateway. Apply after reviewing:
+
+```bash
+terraform plan
+terraform apply
+```
+
+Check the resulting hostname and resolve it from a client in the linked VNet:
+
+```bash
+terraform output -raw website_private_dns_fqdn
+getent hosts nginx.internal.example.com
+curl --fail --show-error http://nginx.internal.example.com/
+```
+
+The private DNS zone only resolves for linked VNets (and networks with appropriate DNS forwarding). Add a link for each client VNet that needs access; do not set `website_client_vnet_id` to the AKS VNet, which already has its own link. For on-premises or corporate DNS clients, configure conditional forwarding through Azure DNS Private Resolver or a DNS forwarder.
+
+**Verified 2026-11-20 from the peered Linux VM:** Azure DNS and `getent` both resolved the website hostname to `10.20.4.250`, and `curl` returned the website page. This verifies DNS and HTTP access from that VM; verify other required networks separately.
+
+For rollback, leave NGINX running and apply with its current internal load-balancer IP as the DNS target:
+
+```bash
+terraform apply -var='website_dns_target_ip=10.20.0.6'
+```
+
+The default `website_dns_target_ip = null` restores the Application Gateway IP on the next apply. Change the override to the actual NGINX IP if it differs from `10.20.0.6`.
 
 ### Verify the deployed website
 
@@ -726,6 +724,8 @@ If a pod has `Insufficient cpu` events, first confirm the pod's request and each
 | AGIC pod events show `ApplicationGatewayInsufficientPermissionOnSubnet` | AGIC subnet permissions | Grant its identity `Network Contributor` on the dedicated Application Gateway subnet. This is managed in [application_gateway.tf](./application_gateway.tf). |
 | AGIC Ingress has a blank `ADDRESS` | AGIC reconciliation | Use the private IP from `terraform output -raw application_gateway_private_ip`; check AGIC logs and Application Gateway backend health if the direct Host-header test fails. |
 | AGIC Ingress event says `NoPublicIP` and Application Gateway returns `502` | Private frontend selection | Add `appgw.ingress.kubernetes.io/use-private-ip: "true"` to the AGIC Ingress. The Helm template sets this for the private-only gateway. |
+| Terraform plans to remove `ingress-for-aks-cluster-id` or `managed-by-k8s-ingress` tags | AGIC/Terraform drift | AGIC adds these tags to the gateway. [application_gateway.tf](./application_gateway.tf) ignores gateway tags so Terraform preserves them. |
+| Website hostname resolves in the AKS VNet but not a peered client VNet | Private DNS VNet link | Private DNS links are not transitive across VNet peering. Add a link for the client VNet with `website_client_vnet_id` and apply Terraform. |
 
 Useful focused checks:
 
@@ -799,7 +799,7 @@ kubectl logs -n kube-system deployment/ingress-appgw-deployment --tail=50
 
 **Cause:** This Application Gateway intentionally has only a private frontend. AGIC needs the Ingress to opt in to that private frontend.
 
-**Fix:** The [AGIC test Ingress template](./charts/nginx-site/templates/ingress-application-gateway.yaml) sets `appgw.ingress.kubernetes.io/use-private-ip: "true"`. For an immediate live fix before the updated chart is deployed, run:
+**Resolution:** The [AGIC test Ingress template](./charts/nginx-site/templates/ingress-application-gateway.yaml) sets `appgw.ingress.kubernetes.io/use-private-ip: "true"`. The live Ingress was annotated and AGIC reconciled it; `kubectl get ingress -n web -o wide` then showed address `10.20.4.250`, and a direct request with the matching Host header returned `HTTP 200`. To apply the annotation immediately before deploying the updated chart, run:
 
 ```bash
 kubectl annotate ingress nginx-site-nginx-site-appgw \
@@ -809,6 +809,20 @@ kubectl annotate ingress nginx-site-nginx-site-appgw \
 ```
 
 Then redeploy the updated chart through GitHub Actions so Helm keeps the annotation. Confirm the `NoPublicIP` event stops appearing and retest the private gateway IP with the hostname in the `Host` header.
+
+#### Terraform reports missing Private DNS name and resource group arguments
+
+**Error:** `terraform validate` reports missing `private_dns_zone_name` and `resource_group_name` for the VNet link, missing `zone_name` and `resource_group_name` for the A record, and rejects `private_dns_zone_id`.
+
+**Cause and resolution:** The schema in the AzureRM provider selected by this project requires the zone name and resource group for these resources. [dns.tf](./dns.tf) now uses those required arguments and removes the unsupported `private_dns_zone_id`.
+
+#### Website DNS does not resolve from a peered VNet
+
+**Observation:** The A record exists and points to `10.20.4.250`, and the Private DNS link to the AKS VNet is `Completed`, but a VM in a peered VNet gets no DNS answer.
+
+**Cause:** Azure Private DNS zone links are per-VNet; VNet peering does not make the zone resolvable from the peer.
+
+**Fix:** Set `website_client_vnet_id` to the client VM's VNet resource ID in `terraform.tfvars` and apply. [dns.tf](./dns.tf) creates the additional link when this value is set. Verify the link is `Completed`, then check `getent hosts nginx.internal.example.com` and `curl --fail --show-error http://nginx.internal.example.com/` from the client VM. If a direct query to `168.63.129.16` succeeds but `getent` still fails, check whether the client VNet uses a custom DNS server and configure forwarding for the private zone.
 
 #### Grafana major version rejected by the AzureRM provider
 
@@ -847,7 +861,7 @@ Do not run `terraform destroy` unless you intend to delete Terraform-managed Azu
 
 | Path | Purpose |
 |---|---|
-| `main.tf`, `application_gateway.tf`, `monitoring.tf`, `variables.tf`, `outputs.tf`, `versions.tf` | AKS, ingress gateway, monitoring, and Terraform configuration. |
+| `main.tf`, `application_gateway.tf`, `dns.tf`, `monitoring.tf`, `variables.tf`, `outputs.tf`, `versions.tf` | AKS, ingress gateway, private website DNS, monitoring, and Terraform configuration. |
 | `terraform.tfvars.example` | Safe-to-commit sample input values. Copy it to ignored `terraform.tfvars` and fill in your own values. |
 | `.gitignore` | Excludes Terraform state and actual `.tfvars` files. |
 | `.github/workflows/deploy.yml` | Image build/push and AKS deployment workflow. |
@@ -855,3 +869,6 @@ Do not run `terraform destroy` unless you intend to delete Terraform-managed Azu
 | `charts/nginx-site/` | Helm chart for the website Deployment, Service, and Ingress. |
 | `deploy/nginx-internal-controller.yaml` | AKS-managed internal ingress-controller configuration and minimum replica setting. |
 | `HELM-INGRESS-GUIDE.md` | Beginner-friendly explanation of Helm, Ingress, every related template, testing, and troubleshooting. |
+| `NGINX-INGRESS-IMPLEMENTATION.md` | Rebuild guide for the original internal NGINX Ingress, including deployment steps and errors/resolutions. |
+| `AKS-MONITORING-IMPLEMENTATION.md` | Monitoring architecture, Terraform resources, verification steps, access requirements, and Grafana version troubleshooting. |
+| `NGINX-TO-AGIC-MIGRATION.md` | Detailed migration record for the private Application Gateway/AGIC route, DNS, rollback, and encountered errors. |
