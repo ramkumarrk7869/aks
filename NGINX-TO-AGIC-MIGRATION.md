@@ -4,9 +4,9 @@ This guide records the migration stages, current state, verification commands, r
 
 ## Status and last confirmed state
 
-The last cluster output shared on 2026-11-20 showed both Ingresses and working DNS. The user deferred promotion on 2026-11-20 and approved it on 2026-11-27. The chart/workflow source has now been updated to make AGIC primary and retain NGINX for rollback; deployment of this updated source to the cluster is still pending.
+The last live Ingress output shared on 2026-11-20 showed both Ingresses and working DNS. On 2026-11-27, Helm output showed the release with `ingress.nginxRollback.enabled: true` and a rendered manifest containing both the AGIC and NGINX Ingresses. This confirms the promoted chart configuration is installed in the Helm release. Check the live Ingress list and controller status after deployment to confirm both controllers have reconciled their routes.
 
-The website's DNS cutover to Application Gateway was already working before chart promotion. The chart now describes AGIC as the primary/default Ingress and NGINX as an enabled rollback route, but the cluster has not yet been updated with this chart revision. Both controllers and routes should be retained. No NGINX cleanup has been performed.
+The website's DNS cutover to Application Gateway was already working before chart promotion. The chart now describes AGIC as the primary/default Ingress and NGINX as an enabled rollback route. Both controllers and routes should be retained. No NGINX cleanup has been performed.
 
 The latest reported command was:
 
@@ -296,14 +296,12 @@ The DNS cutover is already complete and the current source changes are ready to 
 
 ### Deploy the promotion
 
-The changes are not live merely because files were edited. To promote:
-
 ```bash
 git status --short
 git diff --check
 ```
 
-Review the changes, commit/push the chart and workflow to the intended branch, then manually run **Actions → Build and deploy nginx site → Run workflow** and select that branch. The workflow is `workflow_dispatch`; a push alone does not deploy. The self-hosted runner needs private DNS/network reachability to the AKS API, as before.
+For a new deployment, review the changes, commit/push the chart and workflow to the intended branch, then manually run **Actions → Build and deploy nginx site → Run workflow** and select that branch. The workflow is `workflow_dispatch`; a push alone does not deploy. The self-hosted runner needs private DNS/network reachability to the AKS API, as before. The Helm values and manifest output shared on 2026-11-27 confirm that this deployment has since been performed.
 
 The workflow builds/pushes a fresh application image, applies the NGINX controller resource, and upgrades the Helm release. The image update is independent of ingress promotion but occurs in the same workflow.
 
@@ -312,12 +310,21 @@ The workflow builds/pushes a fresh application image, applies the NGINX controll
 From a host that can access the private AKS API and application networks, inspect Helm values and both live routes:
 
 ```bash
+helm list --namespace web
 helm get values nginx-site --namespace web
+helm get values nginx-site --namespace web --all
 helm get manifest nginx-site --namespace web
 kubectl get deployment,service,ingress -n web -o wide
+kubectl get ingress -n web -o wide
 kubectl get nginxingresscontroller nginx-internal
 kubectl get service nginx-internal-0 -n app-routing-system -o wide
 ```
+
+In the Helm commands, `nginx-site` is the **release name**, not a namespace or a Kubernetes object. It is the first argument in the workflow command `helm upgrade --install nginx-site ./charts/nginx-site`; `./charts/nginx-site` is the chart directory, whose `Chart.yaml` also names the chart `nginx-site`. `--namespace web` tells Helm which namespace contains this release. Check releases with `helm list --namespace web`.
+
+`helm get values` without `--all` shows only user-supplied overrides stored for that release. In the output, `image.repository` and `image.tag` are set by workflow command-line overrides: the ACR login server plus image name, and the Git commit SHA. `ingress.host` comes from the workflow's `NGINX_HOST` secret. `ingress.nginxRollback.enabled: true` is passed explicitly by the workflow. The chart defaults, such as `ingress.className: azure-application-gateway`, are in `values.yaml`; `helm get values --all` shows the merged defaults and overrides.
+
+The manifest command shows the Kubernetes YAML Helm rendered and stored for the release. The cluster namespace contains the resulting resources, but `kubectl get all -n web` does **not** include Ingress objects. Use `kubectl get ingress -n web -o wide` to view them. Resource names such as `nginx-site-nginx-site` are generated from the Helm release name plus chart name by the chart's fullname helper; the doubled text is expected because both names happen to be `nginx-site`.
 
 Expected:
 
@@ -327,6 +334,161 @@ Expected:
 - The NGINX controller and its internal Service remain Ready with a private IP.
 
 `kubectl get ingress` should still show two entries. That is expected and is not evidence that promotion failed. Promotion changes which controller the chart treats as primary and preserves the alternate route; it does not make the other Ingress disappear.
+
+### Identify which controller handles an Ingress
+
+An Ingress is a routing rule; an Ingress controller watches rules with its class and configures the actual traffic endpoint. Check the class on every Ingress and the installed IngressClass-to-controller mapping:
+
+```bash
+kubectl get ingress --all-namespaces -o wide
+kubectl get ingressclass \
+  -o custom-columns='NAME:.metadata.name,CONTROLLER:.spec.controller'
+kubectl describe ingress nginx-site-nginx-site-appgw --namespace web
+kubectl describe ingress nginx-site-nginx-site --namespace web
+```
+
+In this cluster, the expected mapping is:
+
+| Ingress | `CLASS` / `spec.ingressClassName` | Controller |
+|---|---|---|
+| `nginx-site-nginx-site-appgw` | `azure-application-gateway` (`azure/application-gateway`) | AGIC, which configures the private Application Gateway |
+| `nginx-site-nginx-site` | `nginx-internal` (`approuting.kubernetes.azure.com/nginx-internal`) | AKS application-routing NGINX controller |
+
+The class is the key: the controller whose configured class matches `spec.ingressClassName` is responsible for that Ingress. The address shown by `kubectl get ingress` is a useful cross-check, not the controller's identity by itself: AGIC should report the Application Gateway private IP, while NGINX should report its internal load-balancer IP. Ingress events from `kubectl describe ingress` can also show reconciliation warnings.
+
+### Where the IngressClass controller values come from
+
+The `CONTROLLER` column is the `spec.controller` field on each Kubernetes `IngressClass`. It identifies the controller implementation; it is different from the class name used by an Ingress:
+
+- `azure-application-gateway` is the IngressClass **name**; `azure/application-gateway` is its controller identifier. Terraform enables the AKS AGIC add-on through the `ingress_application_gateway` block in [main.tf](./main.tf). The AKS/AGIC add-on creates and manages this IngressClass; this repository does not declare its `spec.controller` string directly.
+- `nginx-internal` is the IngressClass **name**; `approuting.kubernetes.azure.com/nginx-internal` is its controller identifier. [deploy/nginx-internal-controller.yaml](./deploy/nginx-internal-controller.yaml) declares the AKS `NginxIngressController` custom resource with `spec.ingressClassName: nginx-internal`. The AKS application-routing add-on creates and manages the corresponding IngressClass and controller identifier.
+- The Helm chart's `ingress.className` and `ingress.nginxRollback.className` values set `spec.ingressClassName` on the two website Ingresses. They select existing classes; they do not create or assign the `spec.controller` identifiers.
+
+Inspect the full class objects and, for the AKS-managed NGINX controller, its generated-resource references with:
+
+```bash
+kubectl get ingressclass azure-application-gateway -o yaml
+kubectl get ingressclass nginx-internal -o yaml
+kubectl get nginxingresscontroller nginx-internal -o yaml
+```
+
+### Inspect the controller configurations
+
+The `Ingress` objects show application routing rules. Controller configuration is managed separately:
+
+**AKS application-routing NGINX controller**
+
+```bash
+kubectl get nginxingresscontroller --all-namespaces
+kubectl get nginxingresscontroller nginx-internal -o yaml
+kubectl get deployment,service,configmap,hpa,poddisruptionbudgets,serviceaccounts \
+  --namespace app-routing-system -o wide
+kubectl describe deployment nginx-internal-0 --namespace app-routing-system
+kubectl logs deployment/nginx-internal-0 \
+  --namespace app-routing-system --tail=100
+```
+
+The `NginxIngressController` resource is the supported configuration surface: inspect its `spec` for class, resource prefix, scaling, and load-balancer annotations; inspect `status` for readiness and managed resource references. The Deployment, Service, ConfigMap, HPA, and other listed resources are generated/managed by the AKS add-on. Treat these as read-only; configure the controller through the custom resource rather than editing generated resources directly.
+
+**AGIC and Application Gateway**
+
+```bash
+RG="$(terraform output -raw resource_group_name)"
+CLUSTER="$(terraform output -raw cluster_name)"
+kubectl get deployment ingress-appgw-deployment \
+  --namespace kube-system -o yaml
+kubectl logs deployment/ingress-appgw-deployment \
+  --namespace kube-system --tail=100
+az aks show --resource-group "$RG" --name "$CLUSTER" \
+  --query addonProfiles.ingressApplicationGateway -o yaml
+az network application-gateway show-backend-health \
+  --resource-group "$RG" --name "${CLUSTER}-appgw" --output table
+```
+
+The AKS add-on status shows whether AGIC is enabled; the AGIC Deployment and logs show its Kubernetes-side health/reconciliation. The backend-health command checks whether Application Gateway can reach the configured website backends. Also inspect the website Ingress itself to see the host, class, annotations, and Service backend:
+
+```bash
+kubectl get ingress nginx-site-nginx-site-appgw \
+  --namespace web -o yaml
+```
+
+### Find the hostname AGIC routes
+
+The hostname is configured on the Kubernetes Ingress rule; AGIC reads that rule and configures the Application Gateway listener/routing rule for it. In this repository, the chart default is `ingress.host: nginx.internal.example.com` in `values.yaml`. The GitHub Actions workflow overrides it with `--set-string ingress.host="$NGINX_HOST"`, where `NGINX_HOST` is a repository Actions secret. The live Ingress is the authoritative value currently applied:
+
+```bash
+kubectl get ingress nginx-site-nginx-site-appgw --namespace web \
+  -o jsonpath='{.spec.rules[*].host}{"\n"}'
+helm get values nginx-site --namespace web
+```
+
+The output should show `nginx.internal.example.com`; `kubectl describe ingress nginx-site-nginx-site-appgw -n web` also displays it under `Rules` → `Host`.
+
+The host rule and DNS are related but configured separately. Terraform in `dns.tf` creates the private DNS zone and A record: defaults in `variables.tf` combine zone `internal.example.com` and record `nginx` into `nginx.internal.example.com`, with the record targeting the Application Gateway private IP by default. Check the DNS target with:
+
+```bash
+terraform output -raw website_private_dns_fqdn
+terraform output -raw application_gateway_private_ip
+nslookup nginx.internal.example.com
+```
+
+For the normal hostname request to reach AGIC, the DNS name the client resolves must match the Ingress host, and DNS must resolve to the Application Gateway frontend. DNS does not set or change the Ingress host.
+
+The outputs shared on 2026-11-27 confirmed these mappings. The `NginxIngressController` reported `Available=True`, `ControllerAvailable=True`, one ready replica, and a managed Deployment/Service in `app-routing-system`. The NGINX LoadBalancer Service address was `10.20.0.6`; the AGIC Ingress address was `10.20.4.250`. Both Ingress descriptions listed the same backend Service and the same two pod endpoints (`10.244.0.194:80` and `10.244.0.124:80`).
+
+### How requests reach the website pods
+
+Both Ingresses match the same hostname and `/` path and route to Service `nginx-site-nginx-site` on port 80. The `web` namespace Service selects the website pods; its endpoints are the two `10.244.x.x` pod IPs.
+
+The hostname is **not assigned directly to a Deployment or Pod**. Follow the routing chain to identify the workload:
+
+1. `kubectl describe ingress ...` shows the host and the backend Service/port.
+2. `kubectl get service ... -o wide` shows the Service selector.
+3. `kubectl get endpoints ... -o wide` shows the ready Pod IPs currently selected by the Service.
+4. `kubectl get pods ... -o wide` maps those IPs to Pod names. The Deployment owns and replaces those Pods.
+
+For this Helm release, the Service selector is `app.kubernetes.io/name=nginx-site,app.kubernetes.io/instance=nginx-site`, and the Deployment uses those same labels in its Pod template:
+
+```bash
+kubectl describe ingress nginx-site-nginx-site-appgw -n web
+kubectl get service nginx-site-nginx-site -n web -o wide
+kubectl get endpoints nginx-site-nginx-site -n web -o wide
+kubectl get pods -n web \
+  -l app.kubernetes.io/name=nginx-site,app.kubernetes.io/instance=nginx-site \
+  -o wide
+kubectl get deployment nginx-site-nginx-site -n web -o wide
+```
+
+In the output you shared, the Ingress backend was `nginx-site-nginx-site:80`, and its endpoints were `10.244.0.194:80` and `10.244.0.124:80`. Match those IPs against the `IP` column from the Pod command to see the exact Pod names. The Deployment `nginx-site-nginx-site` maintains the two website replicas.
+
+```text
+Normal hostname request:
+Client -> DNS nginx.internal.example.com (10.20.4.250)
+       -> Application Gateway listener/backend configured by AGIC
+       -> website pod endpoint on port 80
+
+Direct NGINX rollback request:
+Client -> internal LoadBalancer 10.20.0.6
+       -> nginx-internal controller pod in app-routing-system
+       -> Service nginx-site-nginx-site:80 in namespace web
+       -> website pod endpoint on port 80
+```
+
+AGIC is the controller that programs Application Gateway; it is not an extra proxy hop in the normal request path. NGINX is a proxy hop on the rollback path. The `Host` header matters when testing either route by IP because both Ingresses select a route by hostname.
+
+Check the controller resources, backend Service, and pod endpoints:
+
+```bash
+kubectl get nginxingresscontroller nginx-internal -o yaml
+kubectl get pods,services --namespace app-routing-system -o wide
+kubectl get pods --namespace kube-system | grep ingress-appgw
+kubectl logs --namespace kube-system deployment/ingress-appgw-deployment --tail=50
+kubectl get service nginx-site-nginx-site --namespace web -o wide
+kubectl get endpoints nginx-site-nginx-site --namespace web -o wide
+kubectl get pods --namespace web -o wide
+```
+
+The `NginxIngressController` resource should specify `spec.ingressClassName: nginx-internal`. AGIC runs in `kube-system` as `ingress-appgw-deployment` and handles the `azure-application-gateway` class. If a class is missing, mismatched, or the controller is not Ready, inspect the relevant events and controller logs before relying on that route.
 
 Test the direct routes and DNS hostname:
 

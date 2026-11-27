@@ -88,10 +88,12 @@ What the fields do:
 
 - `kind: NginxIngressController` asks the AKS add-on to provision a managed controller.
 - `metadata.name` identifies the custom resource.
-- `ingressClassName` is the class the website Ingress must use.
-- `controllerNamePrefix` gives generated resources a recognizable name.
+- `ingressClassName` is the class the website Ingress must use. The add-on creates/manages the corresponding `IngressClass`.
+- `controllerNamePrefix` is a separate naming prefix for resources managed by the NGINX controller.
 - `minReplicas: 1` reduces the minimum replica count; it also means less redundancy at low demand. The add-on can scale above this minimum.
 - The Azure Load Balancer annotation requests an **internal** load balancer.
+
+These two values can differ: one selects which Ingress resources the controller watches, while the other names the controller's managed resources. In this example both are `nginx-internal` for clarity. When configuring multiple controllers, use a unique `controllerNamePrefix` for each and make sure each Ingress uses the intended `ingressClassName`. Changing the prefix on an existing controller can affect its managed resource names, so do not change it casually. See [Microsoft's NGINX controller configuration reference](https://learn.microsoft.com/azure/aks/app-routing-nginx-configuration).
 
 Connect to the cluster and apply the resource:
 

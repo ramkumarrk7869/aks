@@ -1,6 +1,6 @@
 # Beginner's Guide to Helm and Ingress
 
-This guide explains how this repository deploys its NGINX website to AKS using Docker, Azure Container Registry (ACR), Helm, and two private ingress routes. The updated chart defines AGIC/Application Gateway as the primary route and retains the AKS-managed `nginx-internal` route for rollback. The chart/workflow changes are prepared in source; they are not live on the cluster until the manual GitHub Actions workflow succeeds.
+This guide explains how this repository deploys its NGINX website to AKS using Docker, Azure Container Registry (ACR), Helm, and two private ingress routes. The chart defines AGIC/Application Gateway as the primary route and retains the AKS-managed `nginx-internal` route for rollback. The latest Helm values and manifest shared on 2026-11-27 confirm that this promoted configuration is installed in the release; check the live Ingresses and controllers to verify reconciliation.
 
 The website hostname was verified through Application Gateway at `10.20.4.250`. The NGINX rollback route was previously tested at `10.20.0.6`. These are last-reported values; check the current addresses before testing.
 
