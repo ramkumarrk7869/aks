@@ -2,7 +2,7 @@
 
 This is a repeatable reference for the original private website route using the AKS application-routing add-on, its managed `nginx-internal` controller, a Helm-deployed website, and an internal Azure Load Balancer. It records the actual configuration and operational issues encountered in this repository.
 
-> **Scope and current state:** This guide covers the NGINX Ingress implementation, before Application Gateway/AGIC. Application Gateway was added later as a parallel route. The current workflow can enable both routes; for an NGINX-only deployment, do not enable the optional AGIC Ingress. Keep the NGINX controller until you intentionally remove it.
+> **Scope and current state:** This guide documents the original NGINX Ingress implementation before Application Gateway/AGIC was added. The repository has since promoted AGIC as the chart's primary route and retains NGINX for rollback. The current chart does not reproduce an NGINX-only deployment by itself; use the historical configuration described here as a reference and adjust the chart templates deliberately if recreating that original state.
 
 ## 1. Architecture
 
@@ -152,7 +152,7 @@ helm upgrade --install nginx-site ./charts/nginx-site \
 
 Replace placeholders with the actual resource group, cluster, registry, image tag, and hostname. The image must exist in ACR and be pullable by AKS. The AKS kubelet identity needs `AcrPull` on ACR. Terraform in this repository assigns that role.
 
-Without AGIC, leave `ingress.applicationGateway.enabled` false (its default). The current workflow contains `--set ingress.applicationGateway.enabled=true` for the later parallel migration test; remove/omit that override for an NGINX-only deployment. Do not change the default NGINX class when reproducing this original route.
+In the original chart, the primary Ingress used class `nginx-internal`, and the later parallel-test version added an optional AGIC Ingress using `ingress.applicationGateway.enabled=true`. The current chart no longer uses that optional setting: it defines AGIC as primary and renders the NGINX rollback route using `ingress.nginxRollback.enabled=true`. Do not apply the historical command unchanged and assume it creates an NGINX-only route.
 
 Optionally render the resources before applying:
 
@@ -209,7 +209,7 @@ Required repository Actions values/secrets in the current workflow:
 - `AKS_RESOURCE_GROUP`, `AKS_CLUSTER_NAME`: target cluster.
 - `NGINX_HOST`: exact Ingress hostname, e.g. `nginx.internal.example.com`.
 
-The image name is `nginx-site`; the image tag is `${{ github.sha }}`. For the parallel AGIC test stage, the workflow additionally sets `ingress.applicationGateway.enabled=true`; that is not needed for the original NGINX-only route.
+The image name is `nginx-site`; the image tag is `${{ github.sha }}`. The earlier parallel-test workflow additionally set `ingress.applicationGateway.enabled=true`. That setting belongs to the old chart configuration and is not used by the current promoted chart.
 
 ## 5. Verify the Kubernetes resources
 

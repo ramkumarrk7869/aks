@@ -4,9 +4,9 @@ This guide records the migration stages, current state, verification commands, r
 
 ## Status and last confirmed state
 
-The last cluster output shared on 2026-11-20 showed both Ingresses and working DNS. As of the user's later decision on 2026-11-20, the chart promotion was intentionally deferred. The repository configuration reviewed on 2026-11-24 still has NGINX as the primary chart Ingress and AGIC as an optional parallel Ingress.
+The last cluster output shared on 2026-11-20 showed both Ingresses and working DNS. The user deferred promotion on 2026-11-20 and approved it on 2026-11-27. The chart/workflow source has now been updated to make AGIC primary and retain NGINX for rollback; deployment of this updated source to the cluster is still pending.
 
-The website's DNS cutover to Application Gateway is working, but the Helm chart has **not** been promoted to make AGIC its primary/default Ingress configuration. Both controllers and Ingresses are intentionally retained. No NGINX cleanup has been performed.
+The website's DNS cutover to Application Gateway was already working before chart promotion. The chart now describes AGIC as the primary/default Ingress and NGINX as an enabled rollback route, but the cluster has not yet been updated with this chart revision. Both controllers and routes should be retained. No NGINX cleanup has been performed.
 
 The latest reported command was:
 
@@ -53,7 +53,7 @@ Client -> 10.20.0.6 -> nginx-internal controller -> website backend
 DNS cutover and Helm/chart promotion are separate:
 
 1. **DNS/traffic cutover:** The website hostname points at Application Gateway. This has already been tested successfully.
-2. **Chart promotion:** Change the Helm chart's source-of-truth so AGIC is its primary Ingress and NGINX is explicitly the optional rollback route. This has **not** been applied.
+2. **Chart promotion:** Change the Helm chart's source-of-truth so AGIC is its primary Ingress and NGINX is explicitly the rollback route. This source change is prepared; its GitHub Actions deployment is pending.
 3. **NGINX removal:** A separate later decision after the rollback window and dependency checks. This has **not** been done and is not required for AGIC traffic.
 
 Promoting the chart while preserving both routes should leave `kubectl get ingress -n web` showing two Ingresses with the same names, classes, and addresses. Promotion is not “delete the NGINX Ingress,” and it does not require changing DNS again. Keep the NGINX controller until you intentionally end the rollback period.
@@ -159,7 +159,7 @@ Expected: add-on `true`, AGIC pod `Running`/Ready, gateway `Running`, and the fr
 
 ### 3. Add an AGIC Ingress alongside NGINX
 
-The current Helm chart uses `ingress.className: nginx-internal` for the original Ingress. The optional [ingress-application-gateway.yaml](./charts/nginx-site/templates/ingress-application-gateway.yaml) creates a second Ingress when `ingress.applicationGateway.enabled` is true. It uses class `azure-application-gateway` and the same host, path, and Service backend.
+Before promotion, the Helm chart used `ingress.className: nginx-internal` for the original Ingress. The optional AGIC template created a second Ingress when `ingress.applicationGateway.enabled` was true. The promoted chart now defines the AGIC Ingress as primary in [ingress.yaml](./charts/nginx-site/templates/ingress.yaml) and preserves NGINX in [ingress-nginx-rollback.yaml](./charts/nginx-site/templates/ingress-nginx-rollback.yaml).
 
 Because this gateway has only a private frontend, the AGIC Ingress must include:
 
@@ -167,12 +167,18 @@ Because this gateway has only a private frontend, the AGIC Ingress must include:
 appgw.ingress.kubernetes.io/use-private-ip: "true"
 ```
 
-The rendered test Ingress is named `<Helm-release>-<chart-name>-appgw`; with release and chart name both `nginx-site`, its name is `nginx-site-nginx-site-appgw`. It points to Service `nginx-site-nginx-site`, port 80. The original NGINX Ingress keeps its existing name `nginx-site-nginx-site`. Keeping the two Ingresses separate allows each controller to process only its own class while both routes target the same pods.
+The AGIC Ingress is named `<Helm-release>-<chart-name>-appgw`; with release and chart name both `nginx-site`, its name is `nginx-site-nginx-site-appgw`. The NGINX Ingress keeps its existing name `nginx-site-nginx-site`. Both point to Service `nginx-site-nginx-site`, port 80. Keeping the two Ingresses separate allows each controller to process only its own class while both routes target the same pods.
 
-The GitHub Actions workflow at [.github/workflows/deploy.yml](./.github/workflows/deploy.yml) enables the optional route with:
+The parallel-test workflow previously enabled AGIC with:
 
 ```bash
 --set ingress.applicationGateway.enabled=true
+```
+
+The promoted workflow now enables the NGINX rollback route with:
+
+```bash
+--set ingress.nginxRollback.enabled=true
 ```
 
 The workflow is manually started from **Actions → Build and deploy nginx site → Run workflow**. It builds/pushes the website image, gets AKS credentials, applies [deploy/nginx-internal-controller.yaml](./deploy/nginx-internal-controller.yaml), and runs Helm. Since the AKS API is private, its self-hosted runner needs private network and DNS access to that API.
@@ -274,29 +280,88 @@ terraform apply -var='website_dns_target_ip=10.20.0.6'
 
 To return the website DNS record to Application Gateway, apply with `website_dns_target_ip = null` (the default) and verify the plan before applying. Use the actual current NGINX service IP if it differs from `10.20.0.6`. The Terraform A record TTL is 300 seconds, but client/recursive resolver caches can affect when the changed answer is observed. Verify DNS and HTTP after the change; keep both ingress routes running during rollback.
 
-## Promotion and final cleanup are pending
+## Promote AGIC and keep NGINX for rollback
 
-The live cluster currently has the original NGINX Ingress plus the parallel AGIC test Ingress. The production hostname already goes to Application Gateway because DNS points to `10.20.4.250`. The Helm chart still describes NGINX as its normal Ingress and AGIC as the optional parallel route.
+The DNS cutover is already complete and the current source changes are ready to deploy. The latest cluster output shared was the original NGINX Ingress plus the parallel AGIC Ingress. The next deployment changes the chart's defaults/ownership intent while keeping both routes.
 
-No promotion or NGINX removal is being performed as part of this guide. When you decide to promote the chart, make a separate reviewed change so AGIC is the chart's primary route and NGINX remains an explicitly enabled rollback route. Preserve the existing Ingress names if practical, deploy through the manual workflow, then verify both routes, DNS, and HTTP from every required client network. Do not remove `nginx-internal` until the rollback window is over and you have verified that no other workloads depend on it.
+### Changes made for promotion
 
-For clarity, the current repository/workflow behavior is:
+- `values.yaml` now defaults `ingress.className` to `azure-application-gateway`.
+- The existing AGIC object name remains `nginx-site-nginx-site-appgw`; the primary template includes `appgw.ingress.kubernetes.io/use-private-ip: "true"`.
+- The old NGINX object name remains `nginx-site-nginx-site`; the new rollback template renders it with class `nginx-internal`.
+- `ingress.nginxRollback.enabled` defaults to `true`, and the workflow explicitly passes `--set ingress.nginxRollback.enabled=true`.
+- The workflow still applies `deploy/nginx-internal-controller.yaml`, so the NGINX controller remains in place.
+- The old optional AGIC template was replaced by the primary AGIC template; resource names, host, path, and Service backend are preserved so Helm should update the same two Ingresses, not delete and recreate them.
+- No Terraform/DNS changes are required for this promotion. The hostname already points to Application Gateway.
 
-- `values.yaml` defaults `ingress.className` to `nginx-internal`.
-- `ingress.applicationGateway.enabled` defaults to `false`.
-- The current workflow passes `--set ingress.applicationGateway.enabled=true`, so it deploys both Ingresses.
-- Terraform DNS points the hostname at Application Gateway by default, independently of the Helm Ingress class.
-- Therefore, seeing both Ingresses in `kubectl get ingress` is expected, and the hostname can already use Application Gateway even though the chart still describes NGINX as its primary/default route.
+### Deploy the promotion
 
-If you later choose to promote, make that a reviewed chart/workflow change and explicitly retain NGINX for rollback. Verify the live Helm release after deploying:
+The changes are not live merely because files were edited. To promote:
+
+```bash
+git status --short
+git diff --check
+```
+
+Review the changes, commit/push the chart and workflow to the intended branch, then manually run **Actions → Build and deploy nginx site → Run workflow** and select that branch. The workflow is `workflow_dispatch`; a push alone does not deploy. The self-hosted runner needs private DNS/network reachability to the AKS API, as before.
+
+The workflow builds/pushes a fresh application image, applies the NGINX controller resource, and upgrades the Helm release. The image update is independent of ingress promotion but occurs in the same workflow.
+
+### Verify after the workflow succeeds
+
+From a host that can access the private AKS API and application networks, inspect Helm values and both live routes:
 
 ```bash
 helm get values nginx-site --namespace web
 helm get manifest nginx-site --namespace web
-kubectl get ingress --namespace web -o wide
+kubectl get deployment,service,ingress -n web -o wide
+kubectl get nginxingresscontroller nginx-internal
+kubectl get service nginx-internal-0 -n app-routing-system -o wide
 ```
 
-The two entries can remain present after promotion. Promotion changes the Helm chart's default/primary configuration and optional rollback behavior; it does not necessarily change the `kubectl get ingress` list or DNS target.
+Expected:
+
+- The Helm user-supplied values show `ingress.nginxRollback.enabled: true`; the chart default primary class is `azure-application-gateway`.
+- `nginx-site-nginx-site-appgw` is class `azure-application-gateway` and points to the gateway private frontend.
+- `nginx-site-nginx-site` is class `nginx-internal`.
+- The NGINX controller and its internal Service remain Ready with a private IP.
+
+`kubectl get ingress` should still show two entries. That is expected and is not evidence that promotion failed. Promotion changes which controller the chart treats as primary and preserves the alternate route; it does not make the other Ingress disappear.
+
+Test the direct routes and DNS hostname:
+
+```bash
+# Direct AGIC test; use a Host header matching the Ingress.
+curl --fail --show-error --connect-timeout 5 \
+  -H "Host: nginx.internal.example.com" \
+  http://10.20.4.250/
+
+# Direct NGINX rollback test; use the current nginx-internal-0 IP.
+curl --fail --show-error --connect-timeout 5 \
+  -H "Host: nginx.internal.example.com" \
+  http://10.20.0.6/
+
+# Normal client request should use the Application Gateway DNS target.
+getent hosts nginx.internal.example.com
+curl --fail --show-error http://nginx.internal.example.com/
+```
+
+Replace the example IPs with current values from Terraform/Kubernetes. The DNS response should be the Application Gateway IP; the direct NGINX test intentionally bypasses DNS. Repeat hostname/DNS and connectivity checks from each required client network.
+
+If AGIC does not reconcile, inspect:
+
+```bash
+kubectl describe ingress nginx-site-nginx-site-appgw --namespace web
+kubectl logs -n kube-system deployment/ingress-appgw-deployment --tail=100
+az network application-gateway show-backend-health \
+  --resource-group "$(terraform output -raw resource_group_name)" \
+  --name "$(terraform output -raw cluster_name)-appgw" \
+  --output table
+```
+
+Do not delete the NGINX controller/Ingress during the rollback period. If the gateway route is unhealthy and you need normal hostname traffic to use NGINX, change `website_dns_target_ip` to the current NGINX Service IP through Terraform, review the plan, apply, and retest DNS and HTTP. When ready to return to AGIC, set the override back to null and apply after reviewing the plan.
+
+Final NGINX cleanup is not part of promotion. Only do it after the rollback window and after confirming no other workloads use `nginx-internal`.
 
 ## Errors and resolutions encountered
 

@@ -1,14 +1,12 @@
-{{- if .Values.ingress.applicationGateway.enabled }}
+{{- if .Values.ingress.nginxRollback.enabled }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ printf "%s-appgw" (include "nginx-site.fullname" .) | trunc 63 | trimSuffix "-" }}
-  annotations:
-    appgw.ingress.kubernetes.io/use-private-ip: "true"
+  name: {{ include "nginx-site.fullname" . }}
   labels:
     {{- include "nginx-site.labels" . | nindent 4 }}
 spec:
-  ingressClassName: {{ .Values.ingress.applicationGateway.className | quote }}
+  ingressClassName: {{ .Values.ingress.nginxRollback.className | quote }}
   rules:
     - host: {{ .Values.ingress.host | quote }}
       http:

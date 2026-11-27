@@ -1,8 +1,8 @@
 # Beginner's Guide to Helm and Ingress
 
-This guide explains how this repository deploys its NGINX website to AKS using Docker, Azure Container Registry (ACR), Helm, and an internal Kubernetes Ingress. It describes the actual files and commands in this project, why they are used, and how to verify the result.
+This guide explains how this repository deploys its NGINX website to AKS using Docker, Azure Container Registry (ACR), Helm, and two private ingress routes. The updated chart defines AGIC/Application Gateway as the primary route and retains the AKS-managed `nginx-internal` route for rollback. The chart/workflow changes are prepared in source; they are not live on the cluster until the manual GitHub Actions workflow succeeds.
 
-The website was verified by sending a request to the internal load balancer at `10.20.0.6` with the expected host name. The response contained the “Hello from NGINX on private AKS” page. Your load balancer IP can change; always check the current service address.
+The website hostname was verified through Application Gateway at `10.20.4.250`. The NGINX rollback route was previously tested at `10.20.0.6`. These are last-reported values; check the current addresses before testing.
 
 ## 1. The big picture
 
@@ -13,33 +13,25 @@ These are separate pieces that work together:
 - **Kubernetes Deployment:** Keeps the requested number of website pods running.
 - **Kubernetes Service:** Provides a stable in-cluster address for those pods.
 - **Ingress:** A set of HTTP routing rules. It says which host and path should go to which Service.
-- **Ingress controller:** The running NGINX component that reads Ingress rules and handles HTTP requests.
+- **Ingress controllers:** AGIC watches its Ingress and configures Application Gateway; NGINX remains as a separate rollback controller.
 - **Helm chart:** A reusable collection of Kubernetes templates and default settings. Helm fills in the templates and installs or updates the Kubernetes resources.
-- **Internal Azure Load Balancer:** Gives the ingress controller a private IP reachable only from networks that can access the AKS VNet.
+- **Private Application Gateway:** Provides the primary frontend IP. The retained NGINX controller has its own internal Azure Load Balancer IP.
 
 The request path looks like this:
 
 ```text
-Browser or curl
-    |
-    | HTTP request to nginx.internal.example.com
-    v
-Private Azure Load Balancer
-    |
-    v
-AKS-managed NGINX ingress controller
-    | Matches the host and path in the Ingress rule
-    v
-Kubernetes Service
-    |
-    v
-One of the website pods running NGINX
-    |
-    v
-site/index.html
+Configuration path:
+Helm Ingress -> AGIC -> Application Gateway listener/backend
+
+Primary HTTP path:
+Browser/curl -> private DNS -> Application Gateway -> website backend -> NGINX pod
+
+Rollback HTTP path:
+Browser/curl -> NGINX internal load balancer -> nginx-internal controller
+             -> website backend -> NGINX pod
 ```
 
-The Ingress is only a rule; it does not run a web server by itself. The controller implements the rule. The Service and Deployment are created by the Helm chart.
+An Ingress is only a rule; it does not run a web server. AGIC watches its Ingress and configures the gateway; AGIC is not itself a proxy in the request path. The Service and Deployment are created by the Helm chart.
 
 ## 2. Files involved
 
@@ -54,8 +46,8 @@ The Ingress is only a rule; it does not run a web server by itself. The controll
 | `charts/nginx-site/templates/_helpers.tpl` | Defines shared names and labels used by the templates. |
 | `charts/nginx-site/templates/deployment.yaml` | Defines the website pods. |
 | `charts/nginx-site/templates/service.yaml` | Defines the stable in-cluster Service for those pods. |
-| `charts/nginx-site/templates/ingress.yaml` | Defines the HTTP host/path routing rule. |
-| `charts/nginx-site/templates/ingress-application-gateway.yaml` | Optionally adds a parallel AGIC route for migration testing. |
+| `charts/nginx-site/templates/ingress.yaml` | Defines the primary AGIC host/path rule and private frontend annotation. |
+| `charts/nginx-site/templates/ingress-nginx-rollback.yaml` | Keeps the optional `nginx-internal` rollback route. |
 | `main.tf` | Enables AKS application routing and configures the AKS node pools. |
 
 ## 3. The web page and container image
@@ -129,13 +121,13 @@ service:
   port: 80
 
 ingress:
-  className: nginx-internal
+  className: azure-application-gateway
   host: nginx.internal.example.com
   path: /
   pathType: Prefix
-  applicationGateway:
-    enabled: false
-    className: azure-application-gateway
+  nginxRollback:
+    enabled: true
+    className: nginx-internal
 ```
 
 - `replicaCount: 2` asks Kubernetes to run two website pods.
@@ -143,10 +135,11 @@ ingress:
 - `pullPolicy` tells Kubernetes when to fetch the image. `IfNotPresent` reuses a copy already cached on the node.
 - `service.type: ClusterIP` means the website Service is reachable inside Kubernetes, not directly from the public internet.
 - The Service listens on port `80`.
-- `ingress.className` selects the internal ingress controller.
+- `ingress.className` selects AGIC for the primary route.
 - `host` and `path` describe which web requests should match the Ingress. The workflow supplies the configured `NGINX_HOST` value for the host.
 - `pathType: Prefix` means `/` and paths below it match this rule.
-- `ingress.applicationGateway.enabled` optionally creates a second Ingress using the `azure-application-gateway` class. The deployment workflow enables it for a side-by-side migration test; the existing NGINX Ingress remains unchanged.
+- `ingress.nginxRollback.enabled` creates the second Ingress using `nginx-internal`; the workflow enables it so NGINX remains available for rollback.
+- The default for `ingress.nginxRollback.enabled` is `true` in the promoted chart so a deployment does not accidentally drop the rollback route.
 
 The default image and hostname are fallback values. During the actual Actions deployment, the workflow provides the ACR image and configured host explicitly.
 
@@ -273,11 +266,13 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ include "nginx-site.fullname" . }}
+  name: {{ printf "%s-appgw" (include "nginx-site.fullname" .) | trunc 63 | trimSuffix "-" }}
+  annotations:
+    appgw.ingress.kubernetes.io/use-private-ip: "true"
   labels:
     {{- include "nginx-site.labels" . | nindent 4 }}
 spec:
-  ingressClassName: {{ .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className | quote }}
   rules:
     - host: {{ .Values.ingress.host | quote }}
       http:
@@ -291,16 +286,18 @@ spec:
                   number: {{ .Values.service.port }}
 ```
 
-- `ingressClassName` tells the cluster which controller should handle this rule: `nginx-internal`.
+- `ingressClassName` tells the cluster which controller handles this rule: `azure-application-gateway`.
+- The `-appgw` name preserves the existing AGIC Ingress object during chart promotion.
+- The private-IP annotation tells AGIC to use this gateway's private frontend.
 - `host` matches the HTTP host name, for example `nginx.internal.example.com`.
 - `path` matches the requested URL path.
 - `backend.service` points to the website Service and its port.
-- The Ingress does not create DNS and does not itself allocate a load balancer. DNS and the controller's load balancer are separate parts.
+- The Ingress does not create DNS or allocate the gateway/load balancer. Those are separate Azure resources.
 - `quote` makes the rendered host a quoted YAML string, which helps avoid YAML parsing ambiguity.
 
-### `charts/nginx-site/templates/ingress-application-gateway.yaml`
+### `charts/nginx-site/templates/ingress-nginx-rollback.yaml`
 
-This optional template sends the same host and path to the same website Service, but selects the AGIC add-on with `ingressClassName: azure-application-gateway`. It sets `appgw.ingress.kubernetes.io/use-private-ip: "true"` because this project provisions a private-only Application Gateway. It creates a separate Ingress object, so NGINX can continue serving its existing Ingress while AGIC configures the Application Gateway route. Test the gateway directly by private IP and a matching `Host` header before changing DNS.
+This optional template sends the same host/path to the same Service but selects `ingressClassName: nginx-internal`. It preserves the original Ingress name (`nginx-site-nginx-site`) so the existing NGINX route can remain available as rollback without replacing the object.
 
 ## 5. The internal ingress controller
 
@@ -355,13 +352,13 @@ web_app_routing {
 
 - `web_app_routing` enables/configures the AKS application-routing add-on.
 - `dns_zone_ids = []` means no Azure DNS zone is attached by this setting; private DNS can be configured separately.
-- `AnnotationControlled` leaves selection of the ingress class to the Ingress resource. Here the chart selects `nginx-internal`.
+- `AnnotationControlled` leaves selection of the NGINX ingress class to the Ingress resource. Here the chart's rollback Ingress selects `nginx-internal`; the primary Ingress selects AGIC.
 
 ### When is `app-routing-system` created?
 
 The `app-routing-system` namespace is part of the AKS application-routing add-on. Azure creates and manages it when the add-on is enabled on the cluster; the add-on runs its controller components and supporting Services there. When the workflow applies `deploy/nginx-internal-controller.yaml`, the add-on observes that custom resource and creates the requested internal controller and its resources in the managed namespace.
 
-This is different from the website namespace, `web`. The workflow's Helm command uses `--namespace web --create-namespace`, so Helm creates `web` if it is missing, then installs the website Deployment, Service, and Ingress there. It does not create `app-routing-system`; that namespace belongs to the AKS add-on. Do not create or manage the add-on's namespace yourself.
+This is different from the website namespace, `web`. The workflow's Helm command uses `--namespace web --create-namespace`, so Helm creates `web` if it is missing, then installs the website Deployment, Service, primary AGIC Ingress, and NGINX rollback Ingress there. It does not create `app-routing-system`; that namespace belongs to the AKS add-on. Do not create or manage the add-on's namespace yourself.
 
 The workflow applies the controller resource before installing the chart. This ordering ensures the cluster has the internal controller configuration before the website Ingress is installed. The namespace may already exist from enabling the add-on; applying the custom resource requests the specific internal controller.
 
@@ -474,6 +471,7 @@ The chart install/update step is:
       --set-string image.repository="$ACR_LOGIN_SERVER/$IMAGE_NAME" \
       --set-string image.tag="$IMAGE_TAG" \
       --set-string ingress.host="$NGINX_HOST" \
+      --set ingress.nginxRollback.enabled=true \
       --wait \
       --timeout 5m
 ```
@@ -484,19 +482,20 @@ The chart install/update step is:
 - `--namespace web` puts the website resources in the `web` namespace.
 - `--create-namespace` creates that namespace if it does not exist.
 - Each `--set-string` overrides a chart value for this deployment. The image comes from ACR and uses the commit tag. The Ingress host comes from the `NGINX_HOST` secret.
+- `--set ingress.nginxRollback.enabled=true` explicitly retains the NGINX Ingress. The chart's primary Ingress is AGIC.
 - `--wait --timeout 5m` asks Helm to wait for resources to become ready, for up to five minutes, before reporting success or failure.
 
 Finally, the workflow prints useful resource details:
 
 ```yaml
-- name: Show deployment and internal ingress
+- name: Show deployment and both ingress routes
   run: |
     kubectl get deployment,service,ingress -n web
     kubectl get nginxingresscontroller nginx-internal
     kubectl get service -n app-routing-system
 ```
 
-This shows the website's Deployment, Service, and Ingress; the controller configuration; and the controller Services where the internal load-balancer IP appears.
+This shows the website's Deployment, Service, and both Ingresses; the NGINX controller configuration; and its Service where the rollback load-balancer IP appears.
 
 In the final command, `-n app-routing-system` is shorthand for `--namespace app-routing-system`. It tells `kubectl` to list Services in the namespace managed by the AKS application-routing add-on. The website resources are listed separately from namespace `web`.
 
@@ -519,6 +518,7 @@ helm upgrade --install nginx-site ./charts/nginx-site \
   --set-string image.repository="<ACR-login-server>/nginx-site" \
   --set-string image.tag="<image-tag-present-in-ACR>" \
   --set-string ingress.host="nginx.internal.example.com" \
+  --set ingress.nginxRollback.enabled=true \
   --wait \
   --timeout 5m
 ```
@@ -532,7 +532,8 @@ helm template nginx-site ./charts/nginx-site \
   --namespace web \
   --set-string image.repository="<ACR-login-server>/nginx-site" \
   --set-string image.tag="<image-tag>" \
-  --set-string ingress.host="nginx.internal.example.com"
+  --set-string ingress.host="nginx.internal.example.com" \
+  --set ingress.nginxRollback.enabled=true
 ```
 
 ## 8. Check that the deployment is ready
@@ -551,28 +552,59 @@ kubectl get service --namespace app-routing-system
 Look for:
 
 - Website pods showing `Running` and `1/1` ready.
-- Ingress controller pods showing `Running` and ready.
-- The website Ingress showing host `nginx.internal.example.com` and class `nginx-internal`.
+- The AGIC Ingress `nginx-site-nginx-site-appgw` showing class `azure-application-gateway` and the Application Gateway private IP.
+- The rollback Ingress `nginx-site-nginx-site` showing class `nginx-internal`.
+- AGIC pod in `kube-system` showing `Running` and ready.
+- NGINX controller pods in `app-routing-system` showing `Running` and ready.
 - The `nginx-internal-0` Service showing a private IP under `EXTERNAL-IP`, not `<pending>`.
 
-The term `EXTERNAL-IP` in Kubernetes output means the address assigned to the Service's load balancer; in this case it is still a private, internal address.
+The term `EXTERNAL-IP` in Kubernetes output means the address assigned to the NGINX controller's load balancer; in this case it is still a private, internal address. The AGIC Ingress `ADDRESS` shows the Application Gateway frontend.
 
 ## 9. Test the website
 
-### Test HTTP routing by IP (DNS not required)
+### Test the primary Application Gateway route by IP (DNS not required)
 
-Run this from a machine that has network connectivity to the AKS VNet or a peered network:
+Run this from a client that can reach the private Application Gateway IP:
 
 ```bash
-INGRESS_IP="<private-ip-from-nginx-internal-0>"
+APPGW_IP="$(terraform output -raw application_gateway_private_ip)"
 NGINX_HOST="nginx.internal.example.com"
 
 curl --fail --show-error --connect-timeout 5 \
   -H "Host: $NGINX_HOST" \
-  "http://$INGRESS_IP/"
+  "http://$APPGW_IP/"
 ```
 
-Replace `INGRESS_IP` with the current IP from the `nginx-internal-0` Service. The `Host` header tells the ingress controller which host rule to use. Without it, the controller may not select this website's Ingress rule.
+The `Host` header must match the AGIC Ingress hostname. This test bypasses DNS but still tests the client network path, Application Gateway listener, AGIC-configured routing, website backend, and pods. If it fails, inspect the AGIC Ingress events, AGIC logs, and Application Gateway backend health before changing DNS:
+
+```bash
+kubectl describe ingress nginx-site-nginx-site-appgw --namespace web
+kubectl logs -n kube-system deployment/ingress-appgw-deployment --tail=100
+az network application-gateway show-backend-health \
+  --resource-group "$(terraform output -raw resource_group_name)" \
+  --name "$(terraform output -raw cluster_name)-appgw" \
+  --output table
+```
+
+### Test the NGINX rollback route by IP
+
+Find the current NGINX controller address:
+
+```bash
+kubectl get service nginx-internal-0 --namespace app-routing-system -o wide
+```
+
+Then test it directly:
+
+```bash
+NGINX_IP="<private-ip-from-nginx-internal-0>"
+NGINX_HOST="nginx.internal.example.com"
+curl --fail --show-error --connect-timeout 5 \
+  -H "Host: $NGINX_HOST" \
+  "http://$NGINX_IP/"
+```
+
+This confirms the NGINX rollback path remains usable. The website hostname itself resolves to Application Gateway, so this direct-IP test is separate.
 
 A successful result contains HTML with:
 
@@ -580,7 +612,7 @@ A successful result contains HTML with:
 <h1>Hello from NGINX on private AKS</h1>
 ```
 
-This is the test that succeeded for this deployment. It tests the network path, controller, host rule, Service, and website pods together, without needing DNS to work first.
+The successful Application Gateway test returned HTML containing the heading above. The separate NGINX route had also been tested successfully during the original deployment.
 
 ### Test the website Service directly
 
@@ -602,7 +634,7 @@ This confirms the Service and website respond through the Kubernetes API tunnel.
 
 The host name in the Ingress is a routing name, not a DNS record by itself. For a browser to use `http://nginx.internal.example.com/`, DNS must resolve that name to the current private ingress IP.
 
-Use an Azure Private DNS zone or your organization's internal DNS. The DNS zone must be reachable by the client: Azure Private DNS zones need VNet links for client VNets, and on-premises clients may need DNS forwarding. The client also needs routes and firewall rules permitting traffic to the private load balancer.
+Use an Azure Private DNS zone or your organization's internal DNS. For the primary route, the hostname should resolve to the Application Gateway IP. Azure Private DNS zones need VNet links for client VNets, and on-premises clients may need DNS forwarding. The client also needs routes and firewall rules permitting traffic to the private Application Gateway IP. The rollback NGINX load balancer has a different private IP.
 
 The `example.com` hostname in this project is an example placeholder. For a real setup, choose a hostname in an internal DNS zone your organization controls, then use that same hostname in:
 

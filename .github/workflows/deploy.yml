@@ -73,11 +73,11 @@ jobs:
             --set-string image.repository="$ACR_LOGIN_SERVER/$IMAGE_NAME" \
             --set-string image.tag="$IMAGE_TAG" \
             --set-string ingress.host="$NGINX_HOST" \
-            --set ingress.applicationGateway.enabled=true \
+            --set ingress.nginxRollback.enabled=true \
             --wait \
             --timeout 5m
 
-      - name: Show deployment and internal ingress
+      - name: Show deployment and both ingress routes
         run: |
           kubectl get deployment,service,ingress -n web
           kubectl get nginxingresscontroller nginx-internal

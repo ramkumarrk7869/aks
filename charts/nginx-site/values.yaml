@@ -10,10 +10,10 @@ service:
   port: 80
 
 ingress:
-  className: nginx-internal
+  className: azure-application-gateway
   host: nginx.internal.example.com
   path: /
   pathType: Prefix
-  applicationGateway:
-    enabled: false
-    className: azure-application-gateway
+  nginxRollback:
+    enabled: true
+    className: nginx-internal

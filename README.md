@@ -11,7 +11,7 @@ For a beginner-friendly, file-by-file explanation of the Helm chart, website Ing
 - [Provision AKS and ACR](#provision-aks-and-acr)
 - [Enable monitoring](#enable-monitoring)
 - [Stage the private Application Gateway](#stage-the-private-application-gateway)
-- [Test the Application Gateway route in parallel](#test-the-application-gateway-route-in-parallel)
+- [Promote AGIC and keep NGINX for rollback](#promote-agic-and-keep-nginx-for-rollback)
 - [Configure GitHub Actions](#configure-github-actions)
 - [Internal access](#internal-access)
 - [Operate and troubleshoot](#operate-and-troubleshoot)
@@ -32,15 +32,15 @@ This repository provisions and deploys a small private website. The major compon
 | Application-routing add-on and `app-routing-system` namespace | Provides the managed NGINX ingress controller platform | AKS |
 | Default NGINX controller | Disabled because this project does not use its `webapprouting.kubernetes.azure.com` class or public load balancer | `web_app_routing.default_nginx_controller = "None"` in `main.tf` |
 | `nginx-internal` controller configuration | Requests a private load balancer and sets the controller's minimum replica count | `deploy/nginx-internal-controller.yaml`, applied by GitHub Actions |
-| Website Deployment, Service, and NGINX/AGIC Ingresses | Runs the website and keeps a parallel AGIC route for migration testing | Helm chart in `charts/nginx-site`, installed by GitHub Actions |
+| Website Deployment, Service, and AGIC/NGINX Ingresses | Routes the hostname through AGIC and keeps NGINX available for rollback | Helm chart in `charts/nginx-site`, installed by GitHub Actions |
 | Container image | NGINX plus `site/index.html` | Dockerfile, pushed to ACR by GitHub Actions |
 
-The website's request path uses the dedicated internal controller; the unused default controller is not part of this path:
+AGIC watches the primary Ingress and configures Application Gateway; it is not itself in the HTTP data path. The current website request path is:
 
 ```text
 Client on a connected private network
-  -> private Azure Load Balancer IP
-  -> AKS-managed NGINX ingress controller
+  -> private DNS resolves hostname to Application Gateway private IP
+  -> Application Gateway listener/backend configured by AGIC
   -> Ingress rule in namespace web
   -> website Service in namespace web
   -> one of the NGINX website pods
@@ -195,41 +195,46 @@ terraform output -raw application_gateway_private_ip
 
 The first output should be `true`; the controller pod should be `Running` and `1/1 Ready`; the gateway should report `Running`; and the final command prints its private frontend IP. Infrastructure readiness alone does not configure an application route. The separate AGIC Ingress has been tested successfully at `10.20.4.250`, and the website hostname now resolves to that IP. NGINX remains available as a rollback option while the final migration cleanup is pending. Terraform ignores AGIC-managed listeners, backend rules, and tags so later plans don't overwrite or remove AGIC's configuration.
 
-## Test the Application Gateway route in parallel
+## Promote AGIC and keep NGINX for rollback
 
-The Helm chart can create a second Ingress for AGIC while keeping the existing `nginx-internal` Ingress. Both use the same host, path, and website Service, but each controller handles only its own Ingress class. The GitHub Actions workflow enables this test Ingress on deployment. It uses `azure-application-gateway`, the AGIC add-on's Ingress class, and the `appgw.ingress.kubernetes.io/use-private-ip: "true"` annotation because this gateway has only a private frontend.
+The direct-IP AGIC test and private DNS cutover succeeded. The chart and workflow source are now set so AGIC is the primary/default Ingress while the existing NGINX Ingress and controller remain enabled for rollback. The source change is prepared but is **not live until the updated workflow is manually run**. Promotion does not remove either Ingress or change DNS; `kubectl get ingress` should still show both routes.
 
-1. Run **Build and deploy nginx site** from GitHub Actions on the branch containing these changes. The workflow deploys the website as before and creates the additional AGIC Ingress. It does not change the existing NGINX Ingress or DNS.
-2. From a VM that can reach both the private AKS API and the Application Gateway subnet/VNet, confirm both Ingress objects exist and have their intended classes:
+The chart preserves the current Kubernetes resource names to avoid deleting/recreating the live routes:
+
+- `nginx-site-nginx-site-appgw`: primary class `azure-application-gateway`, private-IP annotation enabled.
+- `nginx-site-nginx-site`: rollback class `nginx-internal`.
+
+To apply the promotion:
+
+1. Review the chart/workflow changes and commit/push them to your deployment branch.
+2. In GitHub Actions, manually run **Build and deploy nginx site** for that branch. Pushes alone do not trigger deployment.
+3. From a connected machine, verify the release and routes:
 
    ```bash
+   helm get values nginx-site --namespace web
    kubectl get ingress -n web -o wide
+   kubectl get nginxingresscontroller nginx-internal
+   kubectl get service nginx-internal-0 -n app-routing-system -o wide
    ```
 
-   Expect one Ingress with class `nginx-internal` and another with class `azure-application-gateway`. The AGIC Ingress `ADDRESS` can remain blank while AGIC is reconciling; use the Application Gateway's private IP from `terraform output -raw application_gateway_private_ip` for the direct test below.
-3. Test the Application Gateway directly, bypassing DNS. Use the same hostname configured in the GitHub Actions `NGINX_HOST` secret:
+   Expect both Ingress names/classes/addresses to remain: AGIC at the gateway IP (`10.20.4.250` in the last report) and NGINX at its internal load-balancer IP (`10.20.0.6` in the last report). A blank address during reconciliation is not by itself a failure.
+4. Verify DNS and the user path from each required client network:
 
    ```bash
-   APPGW_IP="$(terraform output -raw application_gateway_private_ip)"
-   NGINX_HOST="<your NGINX_HOST value>"
-   curl -i --connect-timeout 5 -H "Host: $NGINX_HOST" "http://$APPGW_IP/"
+   getent hosts nginx.internal.example.com
+   curl --fail --show-error http://nginx.internal.example.com/
    ```
 
-   Expect the website response. If the request fails, check the AGIC logs and Application Gateway backend health before changing DNS:
+   **Previously verified (2026-11-20):** Azure DNS and the tested Linux VM resolved the hostname to `10.20.4.250`; the HTTP request returned the website. Repeat after deployment and for other required networks.
+5. Verify the NGINX rollback route directly:
 
    ```bash
-   kubectl logs -n kube-system deployment/ingress-appgw-deployment --tail=100
-   az network application-gateway show-backend-health \
-     --resource-group "$(terraform output -raw resource_group_name)" \
-     --name "$(terraform output -raw cluster_name)-appgw" \
-     --output table
+   curl --fail --show-error \
+     -H "Host: nginx.internal.example.com" \
+     http://<CURRENT_NGINX_PRIVATE_IP>/
    ```
 
-   **Verified 2026-11-20 (direct-IP test):** AGIC published `10.20.4.250` in the Ingress `ADDRESS`, and a request to that IP with `Host: nginx.internal.example.com` returned `HTTP/1.1 200 OK` with the website page. At that test stage, the website DNS record and NGINX controller had not been changed.
-
-**Verified 2026-11-20:** The private DNS A record resolves `nginx.internal.example.com` to `10.20.4.250` through both Azure DNS and the Linux VM's system resolver; `curl http://nginx.internal.example.com/` returned the website. The hostname cutover is complete for that VM. Confirm the same resolution and HTTP response from every required client network before removing NGINX.
-
-The chart still deploys the original `nginx-internal` Ingress and the temporary AGIC Ingress in parallel, and the NGINX controller is still running. To finish the migration, promote AGIC to the chart's primary Ingress, stop creating the temporary parallel Ingress, and then remove the NGINX controller only after the rollback window and after confirming no other workloads use it. Keep NGINX available until you are ready for that separate cleanup.
+Keep the controller and rollback Ingress until the rollback window ends and no other workloads depend on it. If needed, point the Terraform-managed DNS record back to the current NGINX IP using `website_dns_target_ip`, review the plan, apply, and retest. NGINX removal is a separate later cleanup and is not included in this promotion.
 
 ## Configure GitHub Actions
 
@@ -466,14 +471,14 @@ After enabling the add-on, setting up the runner, and granting roles, start the 
 The workflow builds an image tagged with the commit SHA, pushes it to ACR, gets AKS credentials, applies `deploy/nginx-internal-controller.yaml`, and deploys the chart to namespace `web` with `helm upgrade --install`. The Helm command passes the configured ACR image, image tag, and `NGINX_HOST`, and includes:
 
 ```bash
---set ingress.applicationGateway.enabled=true
+--set ingress.nginxRollback.enabled=true
 ```
 
-That flag creates the second Ingress using class `azure-application-gateway`; the existing Ingress remains on `nginx-internal`. Both route the same host and path to the website Service. The workflow then prints the Deployment, Service, and both Ingresses. This does **not** change DNS or remove the NGINX controller. To verify the parallel route, follow [Test the Application Gateway route in parallel](#test-the-application-gateway-route-in-parallel). See [HELM-INGRESS-GUIDE.md](./HELM-INGRESS-GUIDE.md) for a step-by-step explanation of the chart templates and workflow.
+The chart's main Ingress uses class `azure-application-gateway`; this flag keeps the additional `nginx-internal` rollback Ingress. Both route the same host/path to the website Service. The workflow applies the NGINX controller manifest before the Helm release, so the rollback controller remains provisioned. The workflow prints both routes. DNS already points to Application Gateway and is not changed by Helm. Follow [Promote AGIC and keep NGINX for rollback](#promote-agic-and-keep-nginx-for-rollback) to deploy and verify. See [HELM-INGRESS-GUIDE.md](./HELM-INGRESS-GUIDE.md) for chart/workflow details.
 
 ## Internal access
 
-The chart currently creates two Ingresses for `NGINX_HOST`: the existing `nginx-internal` route and the parallel `azure-application-gateway` route. DNS now points the hostname to Application Gateway; the NGINX internal load balancer remains available for rollback. Inspect both routes and the NGINX controller with:
+The chart creates two Ingresses for `NGINX_HOST`: the primary `azure-application-gateway` route and the `nginx-internal` rollback route. DNS points the hostname to Application Gateway; the NGINX internal load balancer remains available for rollback. Inspect both routes and the controller with:
 
 ```bash
 kubectl get ingress --namespace web
@@ -679,7 +684,7 @@ kubectl describe pods --namespace web
 kubectl describe pods --namespace app-routing-system
 ```
 
-Expected steady state during the parallel migration test: website and controller pods are `Running` and ready; `kubectl get ingress -n web -o wide` shows both `nginx-internal` and `azure-application-gateway` classes; and the `nginx-internal-0` Service has a private IP rather than `<pending>`. Test the Application Gateway with its private IP and a matching Host header using [Test the Application Gateway route in parallel](#test-the-application-gateway-route-in-parallel). Keep NGINX until the gateway route and DNS cutover are verified.
+Expected steady state after promotion: website and controller pods are `Running` and ready; `kubectl get ingress -n web -o wide` shows both `azure-application-gateway` and `nginx-internal` classes; and the `nginx-internal-0` Service has a private IP rather than `<pending>`. Verify the hostname and direct NGINX rollback route using [Promote AGIC and keep NGINX for rollback](#promote-agic-and-keep-nginx-for-rollback). Keep NGINX until the rollback window ends.
 
 ### CPU usage, requests, limits, and node capacity
 
@@ -799,7 +804,7 @@ kubectl logs -n kube-system deployment/ingress-appgw-deployment --tail=50
 
 **Cause:** This Application Gateway intentionally has only a private frontend. AGIC needs the Ingress to opt in to that private frontend.
 
-**Resolution:** The [AGIC test Ingress template](./charts/nginx-site/templates/ingress-application-gateway.yaml) sets `appgw.ingress.kubernetes.io/use-private-ip: "true"`. The live Ingress was annotated and AGIC reconciled it; `kubectl get ingress -n web -o wide` then showed address `10.20.4.250`, and a direct request with the matching Host header returned `HTTP 200`. To apply the annotation immediately before deploying the updated chart, run:
+**Resolution:** The primary [AGIC Ingress template](./charts/nginx-site/templates/ingress.yaml) sets `appgw.ingress.kubernetes.io/use-private-ip: "true"`. During the initial parallel-route test, the live Ingress was annotated and AGIC reconciled it; `kubectl get ingress -n web -o wide` then showed address `10.20.4.250`, and a direct request with the matching Host header returned `HTTP 200`. If the live object is missing the annotation, apply it and redeploy the chart so Helm keeps the setting:
 
 ```bash
 kubectl annotate ingress nginx-site-nginx-site-appgw \
